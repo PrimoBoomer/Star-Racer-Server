@@ -13,8 +13,9 @@ use rapier3d_f64::{
     math::{Pose, Vec3, Vector},
     prelude::{
         ActiveEvents, BroadPhaseBvh, CCDSolver, ChannelEventCollector, ColliderBuilder, ColliderSet, CollisionEvent,
-        ContactForceEvent, ImpulseJointSet, IntegrationParameters, IslandManager, MultibodyJointSet, NarrowPhase,
-        PhysicsPipeline, RigidBodyBuilder, RigidBodyHandle, RigidBodySet,
+        ContactForceEvent, Group, ImpulseJointSet, IntegrationParameters, InteractionGroups, InteractionTestMode,
+        IslandManager, MultibodyJointSet, NarrowPhase, PhysicsPipeline, RigidBodyBuilder, RigidBodyHandle,
+        RigidBodySet,
     },
 };
 use std::{collections::HashMap, sync::mpsc::Receiver};
@@ -107,6 +108,7 @@ impl PhysicsWorld {
         let collider = ColliderBuilder::cuboid(1.75, 1.4, 2.2)
             .density(23.19)
             .friction(0.0) // traction is handled explicitly; contact friction would fight throttle
+            .collision_groups(CAR_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.collider_set
@@ -156,6 +158,23 @@ const LATERAL_GRIP: f64 = 0.90;
 /// Fraction cancelled while drifting (almost none → car slides freely).
 const LATERAL_DRIFT: f64 = 0.08;
 
+// ── Collision groups ──────────────────────────────────────────────────────────
+// GROUP_1 = walls/floor, GROUP_2 = cars.
+// Cars collide with walls but NOT with each other.
+
+/// Walls belong to GROUP_1 and interact with both groups.
+const WALL_COLLISION: InteractionGroups = InteractionGroups::new(
+    Group::GROUP_1,
+    Group::GROUP_1.union(Group::GROUP_2),
+    InteractionTestMode::And,
+);
+/// Cars belong to GROUP_2 and only interact with GROUP_1 (walls).
+const CAR_COLLISION: InteractionGroups = InteractionGroups::new(
+    Group::GROUP_2,
+    Group::GROUP_1,
+    InteractionTestMode::And,
+);
+
 /// Linear damping during normal driving.
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
 /// Reduced linear damping while drifting.
@@ -172,6 +191,10 @@ const LAP_FINISH_X_HALF: f64 = 55.0;
 /// Cars must cross z > LAP_POSITIVE_Z before a finish-line crossing counts.
 /// Prevents the first step from the spawn (z=0 → z<0) being counted as a lap.
 const LAP_POSITIVE_Z: f64 = 50.0;
+/// X coordinate of the halfway checkpoint (opposite side of the track from the finish).
+const CHECKPOINT_X: f64 = -145.0;
+/// Half-width of the checkpoint detection zone on the X axis.
+const CHECKPOINT_X_HALF: f64 = 55.0;
 /// Seconds after the first finisher before the race is forcibly ended.
 const FINISH_WAIT_SECS: f64 = 30.0;
 
@@ -201,6 +224,7 @@ pub(crate) struct Racer {
     laps: u8,
     prev_z: f64,
     crossed_positive_z: bool,
+    crossed_halfway: bool,
     finished: bool,
 }
 
@@ -225,6 +249,7 @@ impl Racer {
             laps: 0,
             prev_z: 0.0,
             crossed_positive_z: false,
+            crossed_halfway: false,
             finished: false,
         }
     }
@@ -316,12 +341,14 @@ impl Lobby {
 
         let floor = ColliderBuilder::cuboid(250.0, 0.5, 250.0)
             .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 0., -0.5, 0.).into())
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(floor);
 
         let wall_center = ColliderBuilder::cuboid(90.0, 2.5, 90.0)
             .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 2.5, 0.).into())
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(wall_center);
@@ -332,6 +359,7 @@ impl Lobby {
 
         let wall_n = ColliderBuilder::cuboid(hx, hy, hz)
             .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 25., 2.5, -225.).into())
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(wall_n);
@@ -354,6 +382,7 @@ impl Lobby {
                 )
                 .into(),
             )
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(wall_e);
@@ -376,6 +405,7 @@ impl Lobby {
                 )
                 .into(),
             )
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(wall_s);
@@ -398,6 +428,7 @@ impl Lobby {
                 )
                 .into(),
             )
+            .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(wall_w);
@@ -434,6 +465,8 @@ impl Lobby {
         let join_msg = ServerMessage::Response(Response::LobbyJoined {
             track_id: 0,
             race_ongoing: self.is_racing(),
+            min_players: self.min_players,
+            max_players: self.max_players,
             error: None,
         });
         ws_stream
@@ -697,6 +730,8 @@ impl Lobby {
                     Pose::new(Vec3::new(spawn_pos.x, spawn_pos.y, spawn_pos.z), Vec3::new(0., 0., 0.)),
                     true,
                 );
+                rb.set_linvel(Vec3::new(0., 0., 0.), true);
+                rb.set_angvel(Vec3::new(0., 0., 0.), true);
             }
             let spawn_info = SpawnInfo {
                 y_rotation: self.spawn_y_rotation,
@@ -713,6 +748,7 @@ impl Lobby {
             racer.laps = 0;
             racer.prev_z = 0.0;
             racer.crossed_positive_z = false;
+            racer.crossed_halfway = false;
             racer.finished = false;
             racer.racing = true;
         }
@@ -845,16 +881,25 @@ impl Lobby {
                 racer.crossed_positive_z = true;
             }
 
+            // Halfway checkpoint (opposite side of the track from the finish line).
+            // The car must cross this before a finish-line crossing counts as a lap,
+            // preventing players from driving back and forth across the finish line.
+            if (x - CHECKPOINT_X).abs() < CHECKPOINT_X_HALF {
+                racer.crossed_halfway = true;
+            }
+
             let prev_z = racer.prev_z;
             // Clockwise lap: car crosses finish line going from +Z side to −Z side.
             // X strip: |x − LAP_FINISH_X| < LAP_FINISH_X_HALF  (covers full track width).
             if racer.crossed_positive_z
+                && racer.crossed_halfway
                 && prev_z >= 0.0
                 && z < 0.0
                 && (x - LAP_FINISH_X).abs() < LAP_FINISH_X_HALF
             {
                 racer.laps += 1;
                 racer.crossed_positive_z = false; // must reach positive-Z again for the next lap
+                racer.crossed_halfway = false; // must pass checkpoint again for the next lap
 
                 sr_log!(info, &racer.nickname, "Lap {}/{}", racer.laps, LAPS_TO_WIN);
 
@@ -865,7 +910,7 @@ impl Lobby {
                     if self.finish_timer == 0.0 {
                         self.finish_timer = FINISH_WAIT_SECS;
                     }
-                    continue; // prev_z update belongs to the dropped racer — skip it
+                    continue; // skip prev_z update — racer is finished
                 }
             }
 

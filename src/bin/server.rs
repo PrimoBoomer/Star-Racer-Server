@@ -5,12 +5,11 @@ use tokio::time::Instant;
 
 pub fn log_init() {
     let launch_time = Instant::now();
-    let target_regex_str = "(.*star_racer.*)";
+    let regex = Regex::new("(.*star_racer.*)").unwrap();
 
     let mut binding = env_logger::builder();
     let builder = binding.format(move |buf, record| {
         let target_str = record.target();
-        let regex = Regex::new(target_regex_str).unwrap();
         let mut results = vec![];
         for (_, [target]) in regex.captures_iter(target_str).map(|c| c.extract()) {
             results.push(target);

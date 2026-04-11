@@ -95,11 +95,12 @@ pub struct LobbyInfo {
 #[derive(Serialize, Deserialize)]
 pub enum Response {
     LobbyList(Vec<LobbyInfo>),
-    /// `error` is None on success. `track_id` and `race_ongoing` are valid only
-    /// when `error` is None.
+    /// `error` is None on success. Other fields are valid only when `error` is None.
     LobbyJoined {
         track_id: u8,
         race_ongoing: bool,
+        min_players: u8,
+        max_players: u8,
         error: Option<JoinError>,
     },
 }
