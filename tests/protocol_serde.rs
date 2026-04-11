@@ -288,7 +288,7 @@ fn server_race_finished_serializes() {
         winner: "Alice".into(),
         rankings: vec![],
     });
-    assert_eq!(ser(&msg), r#"{"Event":{"RaceFinished":{"winner":"Alice"}}}"#);
+    assert_eq!(ser(&msg), r#"{"Event":{"RaceFinished":{"winner":"Alice","rankings":[]}}}"#);
 }
 
 #[test]

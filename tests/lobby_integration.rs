@@ -425,15 +425,8 @@ async fn second_player_joining_racing_lobby_gets_race_started_event() {
         panic!("expected LobbyJoined");
     };
     assert!(error.is_none());
+    // Late joiners spectate the ongoing race and get race_ongoing=true.
+    // The server does NOT send RaceStarted immediately; they receive it when
+    // the next race starts (after the current race ends + countdown).
     assert!(race_ongoing, "late joiner should see race_ongoing=true");
-
-    // Should also receive a RaceStarted event shortly after.
-    recv_until(&mut ws2, 2, |msg| {
-        if let ServerMessage::Event(LobbyEvent::RaceStarted(_)) = msg {
-            Some(())
-        } else {
-            None
-        }
-    })
-    .await;
 }

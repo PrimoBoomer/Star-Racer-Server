@@ -47,8 +47,6 @@ pub enum JoinError {
     LobbyFull,
     LobbyAlreadyExists,
     LobbyNotFound,
-    /// lobby_id or nickname contains reserved characters (angle brackets).
-    InvalidName,
 }
 
 // ── Request / client → server ────────────────────────────────────────────────

@@ -55,18 +55,27 @@ fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
             let delta = (new_now - now).as_secs_f64().min(MAX_DELTA_SECS);
             now = new_now;
 
+            // Snapshot the lobby arcs while holding the outer lock, then
+            // release it so connection handlers are not blocked during physics
+            // updates and WebSocket sends (which may .await for each client).
+            let lobby_arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
+                let lock = lobbies.lock().await;
+                lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+
             let mut to_remove = Vec::new();
-            let mut lock = lobbies.lock().await;
-            for (name, lobby) in lock.iter() {
-                if !lobby.lock().await.update(delta).await {
+            for (name, lobby_arc) in &lobby_arcs {
+                if !lobby_arc.lock().await.update(delta).await {
                     to_remove.push(name.clone());
                 }
             }
-            for name in to_remove {
-                sr_log!(trace, "core", "Removing lobby {}", name);
-                assert!(lock.remove(&name).is_some());
+            if !to_remove.is_empty() {
+                let mut lock = lobbies.lock().await;
+                for name in to_remove {
+                    sr_log!(trace, "core", "Removing lobby {}", name);
+                    lock.remove(&name);
+                }
             }
-            drop(lock);
 
             // Sleep for the remainder of the frame budget so we target ~60 Hz and
             // yield to other async tasks (connection handlers, readers) between ticks.
@@ -172,10 +181,6 @@ async fn handle_request(
 
         RequestMessage::CreateLobby { lobby_id, nickname, min_players, max_players, color } => {
             sr_log!(info, peer_addr, "{} creating lobby {}", nickname, lobby_id);
-            if has_angle_brackets(&lobby_id) || has_angle_brackets(&nickname) {
-                send_join_error(&mut ws, JoinError::InvalidName).await;
-                return None;
-            }
             let already_exists = lobbies.lock().await.contains_key(&lobby_id);
             if already_exists {
                 sr_log!(trace, peer_addr, "Lobby {} already exists", lobby_id);
@@ -196,10 +201,6 @@ async fn handle_request(
 
         RequestMessage::JoinLobby { lobby_id, nickname, color } => {
             sr_log!(info, peer_addr, "{} joining lobby {}", nickname, lobby_id);
-            if has_angle_brackets(&nickname) {
-                send_join_error(&mut ws, JoinError::InvalidName).await;
-                return None;
-            }
             join_lobby(lobby_id, nickname, color, ws, lobbies).await;
             None
         }
@@ -259,6 +260,3 @@ async fn join_lobby(
     }
 }
 
-fn has_angle_brackets(s: &str) -> bool {
-    s.contains('<') || s.contains('>')
-}

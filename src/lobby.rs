@@ -175,7 +175,7 @@ const CAR_COLLISION: InteractionGroups =
 /// Linear damping during normal driving.
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
 /// Reduced linear damping while drifting.
-const DRIFT_LINEAR_DAMPING: f64 = 0.05;
+const DRIFT_LINEAR_DAMPING: f64 = 0.18;
 
 // ── Race / lap constants ───────────────────────────────────────────────────────
 
