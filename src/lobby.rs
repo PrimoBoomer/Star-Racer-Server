@@ -161,6 +161,20 @@ const NORMAL_LINEAR_DAMPING: f64 = 0.3;
 /// Reduced linear damping while drifting.
 const DRIFT_LINEAR_DAMPING: f64 = 0.05;
 
+// ── Race / lap constants ───────────────────────────────────────────────────────
+
+/// Number of laps required to win the race.
+const LAPS_TO_WIN: u8 = 3;
+/// X coordinate of the finish line (matches spawn point x from level.tscn).
+const LAP_FINISH_X: f64 = 145.0;
+/// Half-width of the detection zone on the X axis (covers full track width).
+const LAP_FINISH_X_HALF: f64 = 55.0;
+/// Cars must cross z > LAP_POSITIVE_Z before a finish-line crossing counts.
+/// Prevents the first step from the spawn (z=0 → z<0) being counted as a lap.
+const LAP_POSITIVE_Z: f64 = 50.0;
+/// Seconds after the first finisher before the race is forcibly ended.
+const FINISH_WAIT_SECS: f64 = 30.0;
+
 // ── Racer ─────────────────────────────────────────────────────────────────────
 
 /// Latest input snapshot received from the client.
@@ -184,6 +198,10 @@ pub(crate) struct Racer {
     idx: u8,
     rigid_body: RigidBodyHandle,
     input: PlayerInput,
+    laps: u8,
+    prev_z: f64,
+    crossed_positive_z: bool,
+    finished: bool,
 }
 
 impl Racer {
@@ -204,6 +222,10 @@ impl Racer {
             idx,
             rigid_body: handle,
             input: PlayerInput::default(),
+            laps: 0,
+            prev_z: 0.0,
+            crossed_positive_z: false,
+            finished: false,
         }
     }
 }
@@ -238,6 +260,9 @@ pub struct Lobby {
     spawn_point: Vector3<f64>,
     spawn_y_rotation: f64,
     physics: PhysicsWorld,
+    race_timer: f64,
+    finish_timer: f64,
+    finishers: Vec<String>,
 }
 
 impl Lobby {
@@ -257,6 +282,9 @@ impl Lobby {
             spawn_point: Vector3::new(145.0, 3.0, 0.0),
             spawn_y_rotation: 0.0,
             physics: PhysicsWorld::new(),
+            race_timer: 0.,
+            finish_timer: 0.,
+            finishers: Vec::new(),
         };
         lobby.create_track();
         lobby
@@ -435,6 +463,7 @@ impl Lobby {
         // integrated — clients receive the current frame, not the previous one.
         self.physics.step(delta);
         self.physics.drain_collision_events();
+        self.check_lap_crossings();
         self.broadcast_player_states(delta).await;
         self.tick_state_machine(delta).await;
         true
@@ -590,6 +619,7 @@ impl Lobby {
                 PlayerState {
                     nickname,
                     racing: racer.racing,
+                    laps: racer.laps,
                     position: Vec3Proto { x: t.x, y: t.y, z: t.z },
                     rotation: QuatProto {
                         x: r.x,
@@ -620,7 +650,7 @@ impl Lobby {
             }
             State::Racing => {
                 if !self.race(delta) {
-                    self.to_intermission();
+                    self.to_intermission().await;
                 }
             }
         }
@@ -680,8 +710,15 @@ impl Lobby {
                         .into(),
                 ))
                 .await;
+            racer.laps = 0;
+            racer.prev_z = 0.0;
+            racer.crossed_positive_z = false;
+            racer.finished = false;
             racer.racing = true;
         }
+        self.race_timer = 0.;
+        self.finish_timer = 0.;
+        self.finishers.clear();
         self.state = State::Starting;
     }
 
@@ -722,17 +759,118 @@ impl Lobby {
         self.state = State::Racing;
     }
 
-    fn race(&self, _delta: f64) -> bool {
+    fn race(&mut self, delta: f64) -> bool {
+        self.race_timer += delta;
+
+        // Count down after the first finisher arrives.
+        if self.finish_timer > 0.0 {
+            self.finish_timer -= delta;
+            if self.finish_timer <= 0.0 {
+                return false; // grace period expired
+            }
+        }
+
+        // End immediately once every racing player has finished.
+        let racing: Vec<_> = self.racers.values().filter(|r| r.racing).collect();
+        if !racing.is_empty() && racing.iter().all(|r| r.finished) {
+            return false;
+        }
+
         true
     }
 
-    fn to_intermission(&mut self) {
-        sr_log!(info, &self.name, "-> Intermission");
+    async fn to_intermission(&mut self) {
+        // Rankings: finishers in crossing order, then DNF players sorted by name.
+        let mut rankings = self.finishers.clone();
+        let mut dnf: Vec<String> = self
+            .racers
+            .values()
+            .filter(|r| r.racing && !r.finished)
+            .map(|r| r.nickname.clone())
+            .collect();
+        dnf.sort();
+        rankings.extend(dnf);
+
+        let winner = rankings.first().cloned().unwrap_or_default();
+        sr_log!(
+            info,
+            &self.name,
+            "-> Intermission  winner={} ({}/{} finished in {:.1}s)",
+            winner,
+            self.finishers.len(),
+            self.racers.len(),
+            self.race_timer
+        );
+
+        self.broadcast_message(
+            ServerMessage::Event(LobbyEvent::RaceFinished { winner, rankings }),
+            false,
+        )
+        .await;
+
         for racer in self.racers.values_mut() {
             racer.racing = false;
         }
         self.intermission_timer = 0.;
         self.state = State::Intermission;
+    }
+
+    fn check_lap_crossings(&mut self) {
+        // Collect position snapshots first to release the immutable borrow on self.physics
+        // before we mutate racer state or self.finishers.
+        let snapshots: Vec<(String, f64, f64)> = self
+            .racers
+            .iter()
+            .filter_map(|(name, racer)| {
+                self.physics
+                    .get(racer.rigid_body)
+                    .map(|rb| (name.clone(), rb.translation().x, rb.translation().z))
+            })
+            .collect();
+
+        for (nickname, x, z) in snapshots {
+            let racer = match self.racers.get_mut(&nickname) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            if racer.finished || !racer.racing {
+                racer.prev_z = z;
+                continue;
+            }
+
+            // Gate: car must pass LAP_POSITIVE_Z before any finish-line crossing counts.
+            // This prevents the first physics step from z=0 to z<0 (at spawn) being misread.
+            if z > LAP_POSITIVE_Z {
+                racer.crossed_positive_z = true;
+            }
+
+            let prev_z = racer.prev_z;
+            // Clockwise lap: car crosses finish line going from +Z side to −Z side.
+            // X strip: |x − LAP_FINISH_X| < LAP_FINISH_X_HALF  (covers full track width).
+            if racer.crossed_positive_z
+                && prev_z >= 0.0
+                && z < 0.0
+                && (x - LAP_FINISH_X).abs() < LAP_FINISH_X_HALF
+            {
+                racer.laps += 1;
+                racer.crossed_positive_z = false; // must reach positive-Z again for the next lap
+
+                sr_log!(info, &racer.nickname, "Lap {}/{}", racer.laps, LAPS_TO_WIN);
+
+                if racer.laps >= LAPS_TO_WIN {
+                    racer.finished = true;
+                    let name = racer.nickname.clone();
+                    self.finishers.push(name);
+                    if self.finish_timer == 0.0 {
+                        self.finish_timer = FINISH_WAIT_SECS;
+                    }
+                    continue; // prev_z update belongs to the dropped racer — skip it
+                }
+            }
+
+            racer.prev_z = z;
+        }
     }
 
     async fn broadcast_message(&mut self, message: ServerMessage, for_racing_players: bool) {

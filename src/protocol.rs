@@ -27,6 +27,7 @@ pub type ColorProto = Vec3Proto;
 pub struct PlayerState {
     pub nickname: String,
     pub racing: bool,
+    pub laps: u8,
     pub position: Vec3Proto,
     pub rotation: QuatProto,
     pub color: ColorProto,
@@ -114,7 +115,7 @@ pub enum LobbyEvent {
     Countdown { time: f64 },
     RaceAboutToStart(SpawnInfo),
     RaceStarted(()),
-    RaceFinished { winner: String },
+    RaceFinished { winner: String, rankings: Vec<String> },
     PlayerJoined(String),
     PlayerLeft(String),
 }
