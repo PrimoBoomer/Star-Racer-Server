@@ -1,6 +1,6 @@
 use star_racer_server::protocol::{
-    ClientMessage, ColorProto, JoinError, LobbyEvent, LobbyInfo, LobbyState, PlayerState,
-    QuatProto, RequestMessage, Response, ServerMessage, SpawnInfo, Vec3Proto,
+    ClientMessage, ColorProto, JoinError, LobbyEvent, LobbyInfo, LobbyState, PlayerState, QuatProto, RequestMessage,
+    Response, ServerMessage, SpawnInfo, Vec3Proto,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -14,7 +14,12 @@ fn origin() -> Vec3Proto {
 }
 
 fn identity_quat() -> QuatProto {
-    QuatProto { x: 0.0, y: 0.0, z: 0.0, w: 1.0 }
+    QuatProto {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        w: 1.0,
+    }
 }
 
 fn ser<T: serde::Serialize>(v: &T) -> String {
@@ -43,7 +48,12 @@ fn vec3_deserializes() {
 
 #[test]
 fn quat_serializes() {
-    let q = QuatProto { x: 0.0, y: 0.5, z: 0.0, w: 0.866 };
+    let q = QuatProto {
+        x: 0.0,
+        y: 0.5,
+        z: 0.0,
+        w: 0.866,
+    };
     assert_eq!(ser(&q), r#"{"x":0.0,"y":0.5,"z":0.0,"w":0.866}"#);
 }
 
@@ -268,7 +278,10 @@ fn server_race_started_serializes() {
 
 #[test]
 fn server_race_finished_serializes() {
-    let msg = ServerMessage::Event(LobbyEvent::RaceFinished { winner: "Alice".into() });
+    let msg = ServerMessage::Event(LobbyEvent::RaceFinished {
+        winner: "Alice".into(),
+        rankings: vec![],
+    });
     assert_eq!(ser(&msg), r#"{"Event":{"RaceFinished":{"winner":"Alice"}}}"#);
 }
 
@@ -306,6 +319,7 @@ fn server_players_state_with_player_serializes() {
         position: Vec3Proto { x: 1.0, y: 2.0, z: 3.0 },
         rotation: identity_quat(),
         color: red(),
+        laps: 1,
     }]));
     let v: serde_json::Value = serde_json::from_str(&ser(&msg)).unwrap();
     let p = &v["State"]["Players"][0];
@@ -342,6 +356,7 @@ fn server_players_state_roundtrip() {
         position: origin(),
         rotation: identity_quat(),
         color: ColorProto { x: 0.0, y: 1.0, z: 0.0 },
+        laps: 0,
     }]));
     let json = ser(&original);
     let back: ServerMessage = de(&json);
@@ -352,7 +367,11 @@ fn server_players_state_roundtrip() {
 fn server_race_about_to_start_roundtrip() {
     let original = ServerMessage::Event(LobbyEvent::RaceAboutToStart(SpawnInfo {
         y_rotation: 45.0,
-        position: Vec3Proto { x: 10.0, y: 3.0, z: -5.0 },
+        position: Vec3Proto {
+            x: 10.0,
+            y: 3.0,
+            z: -5.0,
+        },
     }));
     let json = ser(&original);
     let back: ServerMessage = de(&json);
