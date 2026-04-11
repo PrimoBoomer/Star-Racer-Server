@@ -1,7 +1,7 @@
 //! Star Racer bot launcher.
 //!
 //! Each bot is a regular WebSocket client — the server cannot distinguish
-//! bots from human players.  Bots read their own position from the 10 Hz
+//! bots from human players.  Bots read their own position from the 20 Hz
 //! server broadcasts and compute steering every 50 ms (20 Hz).
 //!
 //! # Bot modes
@@ -41,6 +41,8 @@ const ORBIT_RADIUS: f64 = 145.0;
 const LOOKAHEAD_M: f64 = 40.0;
 /// Signed steer magnitude beyond which `Racer` activates drift.
 const DRIFT_THRESHOLD: f64 = 0.60;
+/// Minimum speed (m/s) before drift is sent — mirrors the server-side guard.
+const DRIFT_MIN_SPEED: f64 = 3.0;
 
 // ── 2-D geometry helpers (XZ plane, Y ignored for steering) ───────────────────
 
@@ -100,7 +102,9 @@ enum BotMode {
 struct BotSnapshot {
     racing: bool,
     pos: V2,
+    prev_pos: V2,
     rot: QuatProto,
+    speed: f64,
     /// XZ positions of all other racing players.
     others: Vec<V2>,
 }
@@ -110,12 +114,9 @@ impl Default for BotSnapshot {
         Self {
             racing: false,
             pos: V2::default(),
-            rot: QuatProto {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-                w: 1.0,
-            }, // identity
+            prev_pos: V2::default(),
+            rot: QuatProto { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
+            speed: 0.0,
             others: Vec::new(),
         }
     }
@@ -137,7 +138,9 @@ fn signed_steer(mode: BotMode, snap: &BotSnapshot) -> f64 {
 /// `(steer_left, steer_right, star_drift)` ready to send.
 fn decide(mode: BotMode, snap: &BotSnapshot) -> (f64, f64, bool) {
     let s = signed_steer(mode, snap);
-    let drift = matches!(mode, BotMode::Racer) && s.abs() > DRIFT_THRESHOLD;
+    let drift = matches!(mode, BotMode::Racer)
+        && s.abs() > DRIFT_THRESHOLD
+        && snap.speed > DRIFT_MIN_SPEED;
     ((-s).max(0.0), s.max(0.0), drift)
 }
 
@@ -229,7 +232,11 @@ fn launch_bot(cfg: BotConfig) -> JoinHandle<anyhow::Result<()>> {
                     .collect();
                 if let Some(me) = players.iter().find(|p| p.nickname == my_name) {
                     s.racing = me.racing;
-                    s.pos = V2::new(me.position.x, me.position.z);
+                    let new_pos = V2::new(me.position.x, me.position.z);
+                    // Estimate speed from position delta between broadcasts (~50 ms = 20 Hz).
+                    s.speed = new_pos.sub(s.pos).len() * 20.0;
+                    s.prev_pos = s.pos;
+                    s.pos = new_pos;
                     s.rot = me.rotation;
                 }
             }

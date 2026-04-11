@@ -413,7 +413,7 @@ impl Lobby {
             .await
             .unwrap();
 
-        let (mut tx_stream, rx_stream) = ws_stream.split();
+        let (tx_stream, rx_stream) = ws_stream.split();
         // Do NOT send RaceStarted to late joiners — they spectate the current race
         // and join as a full participant on the next one.
 
