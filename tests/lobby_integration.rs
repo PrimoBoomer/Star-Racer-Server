@@ -161,7 +161,7 @@ async fn create_lobby_returns_joined_ok() {
     send(&mut ws, msg_create("Lobby1", "Alice", 2, 4)).await;
     let msg = recv(&mut ws).await;
 
-    let ServerMessage::Response(Response::LobbyJoined { error, track_id, race_ongoing }) = msg
+    let ServerMessage::Response(Response::LobbyJoined { error, track_id, race_ongoing, .. }) = msg
     else {
         panic!("expected LobbyJoined");
     };

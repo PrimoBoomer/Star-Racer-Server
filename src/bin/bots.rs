@@ -2,14 +2,14 @@
 //!
 //! Spawns 6 lobbies with diverse bot personalities:
 //!
-//! | Lobby          | Bots | Min | Max | Starts immediately? |
-//! |----------------|------|-----|-----|---------------------|
-//! | `<AllStars>`   | 4    | 4   | 4   | yes — mixed modes   |
-//! | `<DriftKings>` | 3    | 3   | 3   | yes — drift-heavy   |
-//! | `<Chaos>`      | 4    | 4   | 4   | yes — erratic mix   |
-//! | `<Arena>`      | 3    | 4   | 4   | no — 1 slot open    |
-//! | `<Duo>`        | 1    | 2   | 3   | no — 1 slot open    |
-//! | `<FFA>`        | 5    | 6   | 6   | no — 1 slot open    |
+//! | Lobby             | Bots | Min | Max | Starts immediately? |
+//! |-------------------|------|-----|-----|---------------------|
+//! | `Bots<AllStars>`  | 4    | 4   | 4   | yes — mixed modes   |
+//! | `Bots<DriftKings>`| 3    | 3   | 3   | yes — drift-heavy   |
+//! | `Bots<Chaos>`     | 4    | 4   | 4   | yes — erratic mix   |
+//! | `Bots<Arena>`     | 3    | 4   | 4   | no — 1 slot open    |
+//! | `Bots<Duo>`       | 1    | 2   | 3   | no — 1 slot open    |
+//! | `Bots<FFA>`       | 5    | 6   | 6   | no — 1 slot open    |
 //!
 //! # Bot modes
 //! | mode       | behaviour |
@@ -238,6 +238,9 @@ fn launch_bot(cfg: BotConfig) -> JoinHandle<anyhow::Result<()>> {
         let snap_write = snapshot.clone();
         let my_name = name.clone();
 
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disconnected_recv = disconnected.clone();
+
         tokio::spawn(async move {
             while let Some(Ok(Message::Text(text))) = read.next().await {
                 let Ok(ServerMessage::State(LobbyState::Players(players))) =
@@ -259,12 +262,17 @@ fn launch_bot(cfg: BotConfig) -> JoinHandle<anyhow::Result<()>> {
                     s.rot = me.rotation;
                 }
             }
+            // WebSocket closed — signal the control loop to exit.
+            disconnected_recv.store(true, std::sync::atomic::Ordering::Relaxed);
         });
 
         // ── Control loop at 20 Hz ────────────────────────────────────────────
         let mut tick: u64 = 0;
         loop {
             sleep(std::time::Duration::from_millis(50)).await;
+            if disconnected.load(std::sync::atomic::Ordering::Relaxed) {
+                return anyhow::Ok(());
+            }
             let snap = snapshot.lock().unwrap().clone();
             if !snap.racing {
                 continue;
@@ -314,7 +322,7 @@ const BOT_NAMES: &[&str] = &[
 
 fn generate_bot_name() -> String {
     let name = BOT_NAMES[(rand::random::<u8>() % BOT_NAMES.len() as u8) as usize];
-    format!("{}{}", name, rand::random::<u8>() % 100)
+    format!("<Bot>{}{}", name, rand::random::<u8>() % 100)
 }
 
 // ── Lobby builder helper ─────────────────────────────────────────────────────
@@ -337,7 +345,8 @@ async fn spawn_lobby(
         min_players,
         max_players,
     }));
-    sleep(std::time::Duration::from_millis(400)).await;
+    // Wait long enough for the creator to connect, send CreateLobby, and get a response.
+    sleep(std::time::Duration::from_millis(1200)).await;
     // Remaining bots join.
     for &mode in &modes[1..] {
         hdls.push(launch_bot(BotConfig {
@@ -347,7 +356,7 @@ async fn spawn_lobby(
             min_players: 0,
             max_players: 0,
         }));
-        sleep(std::time::Duration::from_millis(80)).await;
+        sleep(std::time::Duration::from_millis(150)).await;
     }
 }
 
@@ -362,23 +371,23 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 3 full lobbies (start racing immediately) ────────────────────────────
 
-    // <AllStars> — one of each core mode, clean mixed race.
-    spawn_lobby(&mut hdls, "<AllStars>", 4, 4, &[
+    // Bots<AllStars> — one of each core mode, clean mixed race.
+    spawn_lobby(&mut hdls, "<Bots>AllStars", 4, 4, &[
         BotMode::Orbiter,
         BotMode::Chaser,
         BotMode::Racer,
         BotMode::Wallhugger,
     ]).await;
 
-    // <DriftKings> — drift-heavy lobby, aggressive racing.
-    spawn_lobby(&mut hdls, "<DriftKings>", 3, 3, &[
+    // Bots<DriftKings> — drift-heavy lobby, aggressive racing.
+    spawn_lobby(&mut hdls, "<Bots>DriftKings", 3, 3, &[
         BotMode::Hotshot,
         BotMode::Racer,
         BotMode::Drunk,
     ]).await;
 
-    // <Chaos> — erratic mix, entertaining to watch.
-    spawn_lobby(&mut hdls, "<Chaos>", 4, 4, &[
+    // Bots<Chaos> — erratic mix, entertaining to watch.
+    spawn_lobby(&mut hdls, "<Bots>Chaos", 4, 4, &[
         BotMode::Drunk,
         BotMode::Hotshot,
         BotMode::Chaser,
@@ -387,20 +396,20 @@ async fn main() -> anyhow::Result<()> {
 
     // ── 3 lobbies waiting for 1 human player ─────────────────────────────────
 
-    // <Arena> — 3 bots + 1 open slot, mixed modes.
-    spawn_lobby(&mut hdls, "<Arena>", 4, 4, &[
+    // Bots<Arena> — 3 bots + 1 open slot, mixed modes.
+    spawn_lobby(&mut hdls, "<Bots>Arena", 4, 4, &[
         BotMode::Racer,
         BotMode::Chaser,
         BotMode::Orbiter,
     ]).await;
 
-    // <Duo> — 1 bot, needs 1 human to start.
-    spawn_lobby(&mut hdls, "<Duo>", 2, 3, &[
+    // Bots<Duo> — 1 bot, needs 1 human to start.
+    spawn_lobby(&mut hdls, "<Bots>Duo", 2, 3, &[
         BotMode::Racer,
     ]).await;
 
-    // <FFA> — 5 bots + 1 open slot, big diverse lobby.
-    spawn_lobby(&mut hdls, "<FFA>", 6, 6, &[
+    // Bots<FFA> — 5 bots + 1 open slot, big diverse lobby.
+    spawn_lobby(&mut hdls, "<Bots>FFA", 6, 6, &[
         BotMode::Orbiter,
         BotMode::Chaser,
         BotMode::Racer,

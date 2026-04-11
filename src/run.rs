@@ -172,6 +172,10 @@ async fn handle_request(
 
         RequestMessage::CreateLobby { lobby_id, nickname, min_players, max_players, color } => {
             sr_log!(info, peer_addr, "{} creating lobby {}", nickname, lobby_id);
+            if has_angle_brackets(&lobby_id) || has_angle_brackets(&nickname) {
+                send_join_error(&mut ws, JoinError::InvalidName).await;
+                return None;
+            }
             let already_exists = lobbies.lock().await.contains_key(&lobby_id);
             if already_exists {
                 sr_log!(trace, peer_addr, "Lobby {} already exists", lobby_id);
@@ -192,6 +196,10 @@ async fn handle_request(
 
         RequestMessage::JoinLobby { lobby_id, nickname, color } => {
             sr_log!(info, peer_addr, "{} joining lobby {}", nickname, lobby_id);
+            if has_angle_brackets(&nickname) {
+                send_join_error(&mut ws, JoinError::InvalidName).await;
+                return None;
+            }
             join_lobby(lobby_id, nickname, color, ws, lobbies).await;
             None
         }
@@ -222,6 +230,8 @@ async fn send_join_error(ws: &mut WebSocketStream<TcpStream>, error: JoinError) 
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
+        min_players: 0,
+        max_players: 0,
         error: Some(error),
     });
     let _ = ws.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
@@ -247,4 +257,8 @@ async fn join_lobby(
     if let Err(e) = result {
         sr_log!(trace, "join", "Join failed for {}: {}", lobby_id, e);
     }
+}
+
+fn has_angle_brackets(s: &str) -> bool {
+    s.contains('<') || s.contains('>')
 }

@@ -211,11 +211,13 @@ fn server_lobby_joined_success_serializes() {
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
+        min_players: 2,
+        max_players: 4,
         error: None,
     });
     assert_eq!(
         ser(&msg),
-        r#"{"Response":{"LobbyJoined":{"track_id":0,"race_ongoing":false,"error":null}}}"#
+        r#"{"Response":{"LobbyJoined":{"track_id":0,"race_ongoing":false,"min_players":2,"max_players":4,"error":null}}}"#
     );
 }
 
@@ -224,6 +226,8 @@ fn server_lobby_joined_error_lobby_full_serializes() {
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
+        min_players: 0,
+        max_players: 0,
         error: Some(JoinError::LobbyFull),
     });
     let v: serde_json::Value = serde_json::from_str(&ser(&msg)).unwrap();
@@ -241,6 +245,8 @@ fn server_lobby_joined_all_error_variants_serialize() {
         let msg = ServerMessage::Response(Response::LobbyJoined {
             track_id: 0,
             race_ongoing: false,
+            min_players: 0,
+            max_players: 0,
             error: Some(err),
         });
         let v: serde_json::Value = serde_json::from_str(&ser(&msg)).unwrap();

@@ -169,11 +169,8 @@ const WALL_COLLISION: InteractionGroups = InteractionGroups::new(
     InteractionTestMode::And,
 );
 /// Cars belong to GROUP_2 and only interact with GROUP_1 (walls).
-const CAR_COLLISION: InteractionGroups = InteractionGroups::new(
-    Group::GROUP_2,
-    Group::GROUP_1,
-    InteractionTestMode::And,
-);
+const CAR_COLLISION: InteractionGroups =
+    InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::And);
 
 /// Linear damping during normal driving.
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
@@ -949,6 +946,8 @@ async fn send_join_error(ws_stream: &mut WebSocketStream<TcpStream>, error: Join
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
+        min_players: 0,
+        max_players: 0,
         error: Some(error),
     });
     let _ = ws_stream
