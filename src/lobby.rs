@@ -106,7 +106,7 @@ impl PhysicsWorld {
         // This gives mass ≈ 1000 kg AND a proper inertia tensor (needed for angular physics).
         let collider = ColliderBuilder::cuboid(1.75, 1.4, 2.2)
             .density(23.19)
-            .friction(0.0)  // traction is handled explicitly; contact friction would fight throttle
+            .friction(0.0) // traction is handled explicitly; contact friction would fight throttle
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.collider_set
@@ -414,16 +414,8 @@ impl Lobby {
             .unwrap();
 
         let (mut tx_stream, rx_stream) = ws_stream.split();
-
-        if let State::Racing = self.state {
-            let _ = tx_stream
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceStarted(())))
-                        .unwrap()
-                        .into(),
-                ))
-                .await;
-        }
+        // Do NOT send RaceStarted to late joiners — they spectate the current race
+        // and join as a full participant on the next one.
 
         let (tx_channel, rx_channel) = crossbeam::channel::unbounded::<PlayerEvent>();
         launch_client_reader(nickname.clone(), tx_channel, rx_stream);
@@ -439,9 +431,11 @@ impl Lobby {
         if self.racers.is_empty() {
             return false;
         }
-        self.broadcast_player_states(delta).await;
+        // Step physics first so the broadcast reflects the state *after* inputs are
+        // integrated — clients receive the current frame, not the previous one.
         self.physics.step(delta);
         self.physics.drain_collision_events();
+        self.broadcast_player_states(delta).await;
         self.tick_state_machine(delta).await;
         true
     }
@@ -487,7 +481,12 @@ impl Lobby {
                         star_drift,
                     }) => {
                         // Overwrite with the freshest snapshot; older ones are stale.
-                        racer.input = PlayerInput { throttle, steer_left, steer_right, star_drift };
+                        racer.input = PlayerInput {
+                            throttle,
+                            steer_left,
+                            steer_right,
+                            star_drift,
+                        };
                     }
                     PlayerEvent::Message(_) => {}
                 }
@@ -502,9 +501,13 @@ impl Lobby {
                 continue;
             }
 
-            // Apply the latest known input once per physics tick.
-            let is_drifting = racer.input.star_drift;
             let rb = self.physics.get_mut(racer.rigid_body).unwrap();
+
+            // Apply the latest known input once per physics tick.
+            // Drift only engages above a minimum speed — at low speed the huge yaw
+            // rate target spins the car in place with no lateral velocity to resist it.
+            let speed = rb.linvel().length();
+            let is_drifting = racer.input.star_drift && speed > 3.0;
             rb.reset_forces(true);
 
             // Car axes — computed once, shared by throttle, steering and grip.
@@ -528,7 +531,11 @@ impl Lobby {
             // Mirror client: invert steer when going backward so controls match apparent travel.
 
             let effective_steer = if forward_speed >= -0.5 { steer } else { -steer };
-            let max_turn = if is_drifting { MAX_TURN_RATE_DRIFT } else { MAX_TURN_RATE_GRIP };
+            let max_turn = if is_drifting {
+                MAX_TURN_RATE_DRIFT
+            } else {
+                MAX_TURN_RATE_GRIP
+            };
             // Positive steer = right = negative Y in right-hand Y-up.
             let target_yaw = -effective_steer * max_turn;
             let yaw_error = target_yaw - rb.angvel().y;
@@ -564,7 +571,7 @@ impl Lobby {
 
     async fn broadcast_player_states(&mut self, delta: f64) {
         self.sync_timer += delta;
-        if self.sync_timer <= 0.1 {
+        if self.sync_timer <= 0.05 {
             return;
         }
         self.sync_timer = 0.;
