@@ -453,10 +453,13 @@ impl Lobby {
             return false;
         }
 
+        let state_snapshot = self.prepare_player_state_sync(delta);
         self.physics.step(delta);
         self.physics.drain_collision_events();
         self.check_lap_crossings();
-        self.broadcast_player_states(delta);
+        if let Some(states) = state_snapshot {
+            self.broadcast_player_state_snapshot(states);
+        }
         self.tick_state_machine(delta);
         true
     }
@@ -573,10 +576,10 @@ impl Lobby {
         }
     }
 
-    fn broadcast_player_states(&mut self, delta: f64) {
+    fn prepare_player_state_sync(&mut self, delta: f64) -> Option<Vec<PlayerState>> {
         self.sync_timer += delta;
         if self.sync_timer < STATE_SYNC_INTERVAL {
-            return;
+            return None;
         }
         self.sync_timer = 0.;
 
@@ -608,6 +611,10 @@ impl Lobby {
             });
         }
 
+        Some(states)
+    }
+
+    fn broadcast_player_state_snapshot(&self, states: Vec<PlayerState>) {
         self.broadcast_message(ServerMessage::State(LobbyState::Players(states)), false);
     }
 
@@ -977,9 +984,11 @@ fn launch_client_reader(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_outgoing_batch, effective_steer_input, stabilize_quaternion, update_reverse_mode, OutgoingMessage,
+        collect_outgoing_batch, effective_steer_input, stabilize_quaternion, update_reverse_mode, Lobby,
+        OutgoingMessage, Racer, STATE_SYNC_INTERVAL,
     };
-    use crate::protocol::QuatProto;
+    use crate::protocol::{LobbyState, QuatProto, ServerMessage, Vec3Proto};
+    use crossbeam::channel::unbounded as crossbeam_unbounded;
     use tokio::sync::mpsc::unbounded_channel;
     use tungstenite::Message;
 
@@ -1069,5 +1078,50 @@ mod tests {
         assert_eq!(stabilized.y, prev.y);
         assert_eq!(stabilized.z, prev.z);
         assert_eq!(stabilized.w, prev.w);
+    }
+
+    #[test]
+    fn state_sync_broadcasts_pre_step_pose() {
+        let mut lobby = Lobby::new("Arena".into(), "Alice".into(), "12:00".into(), 2, 4);
+        let (tx_out, mut rx_out) = unbounded_channel();
+        let (_tx_in, rx_in) = crossbeam_unbounded();
+
+        let initial = Vec3Proto {
+            x: 0.0,
+            y: 10.0,
+            z: 0.0,
+        };
+        let color = Vec3Proto { x: 1.0, y: 0.0, z: 0.0 };
+        let handle = lobby.physics.insert_body(initial);
+        let racer = Racer::new("Alice".into(), 0, color, tx_out, rx_in, handle);
+        lobby.racers.insert("Alice".into(), racer);
+
+        assert!(lobby.update(STATE_SYNC_INTERVAL));
+
+        let server_y = lobby
+            .physics
+            .get(handle)
+            .expect("rigid body should still exist")
+            .translation()
+            .y;
+        assert!(
+            server_y < initial.y,
+            "physics step should advance the authoritative body"
+        );
+
+        let outgoing = rx_out.try_recv().expect("expected a synced player state");
+        let OutgoingMessage::State(Message::Text(text)) = outgoing else {
+            panic!("expected state message");
+        };
+        let ServerMessage::State(LobbyState::Players(players)) = serde_json::from_str(&text).unwrap() else {
+            panic!("expected player state payload");
+        };
+
+        assert_eq!(players.len(), 1);
+        assert_eq!(players[0].nickname, "Alice");
+        assert!(
+            (players[0].position.y - initial.y).abs() < f64::EPSILON,
+            "broadcasted pose should stay on the pre-step snapshot"
+        );
     }
 }
