@@ -166,7 +166,7 @@ const CHECKPOINT_X: f64 = -145.0;
 const CHECKPOINT_X_HALF: f64 = 55.0;
 
 const FINISH_WAIT_SECS: f64 = 30.0;
-const STATE_SYNC_INTERVAL: f64 = 1.0 / 60.0;
+const STATE_SYNC_INTERVAL: f64 = 0.05;
 
 #[derive(Default, Clone, Copy)]
 struct PlayerInput {
@@ -552,7 +552,7 @@ impl Lobby {
 
             let steer_amount = effective_steer.abs();
             if steer_amount > 0.0 && forward_speed > 0.0 {
-                let turn_drag = (1.0 - TURN_DRAG_PER_STEER * steer_amount).clamp(0.0, 1.0);
+                let turn_drag = (1.0 - TURN_DRAG_PER_STEER * steer_amount * delta).clamp(0.0, 1.0);
                 let linvel = rb.linvel();
                 let lateral_component = right * lateral_speed;
                 let forward_component = linvel - lateral_component;

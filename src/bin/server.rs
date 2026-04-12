@@ -23,9 +23,18 @@ pub fn log_init() {
     builder.init();
 }
 
+#[cfg(windows)]
+fn raise_timer_resolution() {
+    unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+}
+
+#[cfg(not(windows))]
+fn raise_timer_resolution() {}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     log_init();
+    raise_timer_resolution();
 
     star_racer_server::run::run(8080).await?;
 

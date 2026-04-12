@@ -87,7 +87,7 @@ fn spawn_core_loop(mut rx: mpsc::Receiver<LobbyCommand>) {
                         accumulator -= FIXED_DT_DURATION;
                         steps += 1;
                         if !lobbies.is_empty() {
-                            run_tick(&mut lobbies, FIXED_DT);
+                            run_tick(&mut lobbies, FIXED_DT).await;
                         }
                     }
                     if steps == MAX_STEPS_PER_FRAME {
@@ -111,14 +111,24 @@ fn spawn_core_loop(mut rx: mpsc::Receiver<LobbyCommand>) {
     });
 }
 
-fn run_tick(lobbies: &mut HashMap<String, Lobby>, delta: f64) {
-    lobbies.retain(|name, lobby| {
-        let alive = lobby.update(delta);
-        if !alive {
-            sr_log!(trace, "core", "Removing lobby {}", name);
+async fn run_tick(lobbies: &mut HashMap<String, Lobby>, delta: f64) {
+    let drained: Vec<(String, Lobby)> = lobbies.drain().collect();
+    let mut set = tokio::task::JoinSet::new();
+    for (name, mut lobby) in drained {
+        set.spawn(async move {
+            let alive = lobby.update(delta);
+            (name, lobby, alive)
+        });
+    }
+    while let Some(res) = set.join_next().await {
+        if let Ok((name, lobby, alive)) = res {
+            if alive {
+                lobbies.insert(name, lobby);
+            } else {
+                sr_log!(trace, "core", "Removing lobby {}", name);
+            }
         }
-        alive
-    });
+    }
 }
 
 fn handle_command(cmd: LobbyCommand, lobbies: &mut HashMap<String, Lobby>) {
