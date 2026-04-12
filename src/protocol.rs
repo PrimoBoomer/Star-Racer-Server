@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// ── Primitive geometry types ─────────────────────────────────────────────────
-
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct Vec3Proto {
     pub x: f64,
@@ -17,12 +15,8 @@ pub struct QuatProto {
     pub w: f64,
 }
 
-/// RGB colour (same memory layout as Vec3Proto, distinct type for clarity).
 pub type ColorProto = Vec3Proto;
 
-// ── Complex message types ────────────────────────────────────────────────────
-
-/// Per-player snapshot sent every broadcast tick.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PlayerState {
     pub nickname: String,
@@ -33,14 +27,12 @@ pub struct PlayerState {
     pub color: ColorProto,
 }
 
-/// Data included in the RaceAboutToStart event.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SpawnInfo {
     pub y_rotation: f64,
     pub position: Vec3Proto,
 }
 
-/// Typed error returned inside LobbyJoined on failure.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum JoinError {
     NicknameAlreadyUsed,
@@ -48,8 +40,6 @@ pub enum JoinError {
     LobbyAlreadyExists,
     LobbyNotFound,
 }
-
-// ── Request / client → server ────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize)]
 pub enum RequestMessage {
@@ -79,8 +69,6 @@ pub enum ClientMessage {
     },
 }
 
-// ── Response / server → client ───────────────────────────────────────────────
-
 #[derive(Serialize, Deserialize)]
 pub struct LobbyInfo {
     pub name: String,
@@ -95,7 +83,7 @@ pub struct LobbyInfo {
 #[derive(Serialize, Deserialize)]
 pub enum Response {
     LobbyList(Vec<LobbyInfo>),
-    /// `error` is None on success. Other fields are valid only when `error` is None.
+
     LobbyJoined {
         track_id: u8,
         race_ongoing: bool,

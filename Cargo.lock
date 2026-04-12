@@ -1394,7 +1394,6 @@ dependencies = [
  "nalgebra",
  "rand 0.10.0",
  "rapier3d-f64",
- "regex",
  "serde",
  "serde_json",
  "thiserror",

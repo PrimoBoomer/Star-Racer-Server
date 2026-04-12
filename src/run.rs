@@ -1,18 +1,40 @@
 use crate::{
     error::Error,
-    lobby::Lobby,
+    lobby::{send_join_error, spawn_ws_writer, Lobby},
     protocol::{ClientMessage, ColorProto, JoinError, LobbyInfo, RequestMessage, Response, ServerMessage},
     sr_log, Result,
 };
 use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
-use std::{collections::HashMap, sync::Arc};
+use futures_util::{stream::SplitStream, SinkExt, StreamExt};
+use std::{collections::HashMap, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{oneshot, Mutex},
+    sync::{mpsc, oneshot},
 };
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::Message;
+
+enum LobbyCommand {
+    FetchList {
+        resp: oneshot::Sender<Vec<LobbyInfo>>,
+    },
+    Create {
+        lobby_id: String,
+        nickname: String,
+        min_players: u8,
+        max_players: u8,
+        color: ColorProto,
+        tx_out: mpsc::UnboundedSender<Message>,
+        rx_stream: SplitStream<WebSocketStream<TcpStream>>,
+    },
+    Join {
+        lobby_id: String,
+        nickname: String,
+        color: ColorProto,
+        tx_out: mpsc::UnboundedSender<Message>,
+        rx_stream: SplitStream<WebSocketStream<TcpStream>>,
+    },
+}
 
 pub async fn run(port: u16) -> Result<()> {
     let endpoint = format!("127.0.0.1:{}", port);
@@ -23,121 +45,169 @@ pub async fn run(port: u16) -> Result<()> {
 pub async fn run_with_listener(listener: TcpListener) -> Result<()> {
     sr_log!(trace, "core", "Listening on {}", listener.local_addr().unwrap());
 
-    let lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (cmd_tx, cmd_rx) = mpsc::channel::<LobbyCommand>(64);
 
-    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<RequestMessage>();
-    spawn_game_loop(lobbies.clone(), request_rx);
-    spawn_debug_logger(lobbies.clone());
+    spawn_core_loop(cmd_rx);
 
     loop {
         let (stream, peer_addr) = listener.accept().await.map_err(Error::TcpError)?;
         sr_log!(trace, peer_addr, ">TCP");
-        let lobbies_cln = lobbies.clone();
-        tokio::spawn(handle_connection(
-            stream,
-            peer_addr.to_string(),
-            lobbies_cln,
-            request_tx,
-        ));
+        tokio::spawn(handle_connection(stream, peer_addr.to_string(), cmd_tx.clone()));
     }
 }
 
-const FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(16); // ~60 Hz
-const MAX_DELTA_SECS: f64 = 0.1;
+const FIXED_DT: f64 = 1.0 / 60.0;
+const FIXED_DT_DURATION: Duration = Duration::from_nanos((FIXED_DT * 1_000_000_000.0) as u64);
+const MAX_STEPS_PER_FRAME: u32 = 5;
+const DEBUG_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
-fn spawn_game_loop(
-    lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
-    request_rx: tokio::sync::oneshot::Receiver<RequestMessage>,
-) {
+fn spawn_core_loop(mut rx: mpsc::Receiver<LobbyCommand>) {
     tokio::spawn(async move {
-        let mut now = tokio::time::Instant::now();
+        let mut lobbies: HashMap<String, Lobby> = HashMap::new();
+        let mut next_tick = tokio::time::Instant::now() + FIXED_DT_DURATION;
+        let mut accumulator = Duration::ZERO;
+        let mut last_now = tokio::time::Instant::now();
+        let mut last_debug = tokio::time::Instant::now();
+
         loop {
-            if lobbies.lock().await.is_empty() {
-                now = tokio::time::Instant::now();
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                continue;
-            }
+            tokio::select! {
 
-            let new_now = tokio::time::Instant::now();
-            let delta = (new_now - now).as_secs_f64().min(MAX_DELTA_SECS);
-            now = new_now;
+                biased;
 
-            let lobby_arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
-                let lock = lobbies.lock().await;
-                lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-            };
+                _ = tokio::time::sleep_until(next_tick) => {
+                    let now = tokio::time::Instant::now();
+                    accumulator += now - last_now;
+                    last_now = now;
 
-            let handles: Vec<_> = lobby_arcs
-                .into_iter()
-                .map(|(name, arc)| {
-                    tokio::spawn(async move {
-                        let alive = arc.lock().await.update(delta);
-                        (name, alive)
-                    })
-                })
-                .collect();
+                    let mut steps = 0;
+                    while accumulator >= FIXED_DT_DURATION && steps < MAX_STEPS_PER_FRAME {
+                        accumulator -= FIXED_DT_DURATION;
+                        steps += 1;
+                        if !lobbies.is_empty() {
+                            run_tick(&mut lobbies, FIXED_DT);
+                        }
+                    }
+                    if steps == MAX_STEPS_PER_FRAME {
+                        accumulator = Duration::ZERO;
+                    }
+                    next_tick = now + FIXED_DT_DURATION - accumulator;
 
-            // for lobby in lobbies {}
-
-            let mut to_remove = Vec::new();
-            for handle in handles {
-                if let Ok((name, alive)) = handle.await {
-                    if !alive {
-                        to_remove.push(name);
+                    if last_debug.elapsed() >= DEBUG_LOG_INTERVAL {
+                        last_debug = tokio::time::Instant::now();
+                        log_debug_snapshot(&lobbies);
                     }
                 }
-            }
-            if !to_remove.is_empty() {
-                let mut lock = lobbies.lock().await;
-                for name in to_remove {
-                    sr_log!(trace, "core", "Removing lobby {}", name);
-                    lock.remove(&name);
-                }
-            }
 
-            let elapsed = now.elapsed();
-            if let Some(remaining) = FRAME_DURATION.checked_sub(elapsed) {
-                tokio::time::sleep(remaining).await;
+                Some(cmd) = rx.recv() => {
+                    handle_command(cmd, &mut lobbies);
+                }
+
+                else => return,
             }
         }
     });
 }
 
-fn spawn_debug_logger(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
-                let lock = lobbies.lock().await;
-                if lock.is_empty() {
-                    continue;
-                }
-                sr_log!(trace, "core", "--- lobbies ({}) ---", lock.len());
-                lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+fn run_tick(lobbies: &mut HashMap<String, Lobby>, delta: f64) {
+    lobbies.retain(|name, lobby| {
+        let alive = lobby.update(delta);
+        if !alive {
+            sr_log!(trace, "core", "Removing lobby {}", name);
+        }
+        alive
+    });
+}
+
+fn handle_command(cmd: LobbyCommand, lobbies: &mut HashMap<String, Lobby>) {
+    match cmd {
+        LobbyCommand::FetchList { resp } => {
+            let _ = resp.send(build_lobby_list(lobbies));
+        }
+
+        LobbyCommand::Create {
+            lobby_id,
+            nickname,
+            min_players,
+            max_players,
+            color,
+            tx_out,
+            rx_stream,
+        } => {
+            if lobbies.contains_key(&lobby_id) {
+                sr_log!(trace, "core", "Lobby {} already exists", lobby_id);
+                send_join_error(&tx_out, JoinError::LobbyAlreadyExists);
+                return;
+            }
+            let mut lobby = Lobby::new(
+                lobby_id.clone(),
+                nickname.clone(),
+                Utc::now().format("%H:%M").to_string(),
+                min_players,
+                max_players,
+            );
+            sr_log!(info, "core", "{} created lobby {}", nickname, lobby_id);
+            if let Err(e) = lobby.join(nickname, color, tx_out, rx_stream) {
+                sr_log!(trace, "join", "Join failed for {}: {}", lobby_id, e);
+                return;
+            }
+            lobbies.insert(lobby_id, lobby);
+        }
+
+        LobbyCommand::Join {
+            lobby_id,
+            nickname,
+            color,
+            tx_out,
+            rx_stream,
+        } => {
+            let Some(lobby) = lobbies.get_mut(&lobby_id) else {
+                sr_log!(trace, "join", "Lobby {} not found", lobby_id);
+                send_join_error(&tx_out, JoinError::LobbyNotFound);
+                return;
             };
-            for (name, arc) in arcs {
-                let l = arc.lock().await;
-                let state = if l.is_racing() { "racing" } else { "intermission" };
-                sr_log!(
-                    trace,
-                    "core",
-                    "  [{}] owner={} players={}/{} state={}",
-                    name,
-                    l.owner,
-                    l.player_count(),
-                    l.max_players,
-                    state
-                );
+            if let Err(e) = lobby.join(nickname, color, tx_out, rx_stream) {
+                sr_log!(trace, "join", "Join failed for {}: {}", lobby_id, e);
             }
         }
-    });
+    }
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    peer_addr: String,
-    request_tx: tokio::sync::oneshot::Sender<RequestMessage>,
-) {
+fn build_lobby_list(lobbies: &HashMap<String, Lobby>) -> Vec<LobbyInfo> {
+    lobbies
+        .iter()
+        .map(|(name, l)| LobbyInfo {
+            name: name.clone(),
+            owner: l.owner.clone(),
+            start_time: l.start_time.clone(),
+            player_count: l.player_count(),
+            min_players: l.min_players,
+            max_players: l.max_players,
+            racing: l.is_racing(),
+        })
+        .collect()
+}
+
+fn log_debug_snapshot(lobbies: &HashMap<String, Lobby>) {
+    if lobbies.is_empty() {
+        return;
+    }
+    sr_log!(trace, "core", "--- lobbies ({}) ---", lobbies.len());
+    for (name, l) in lobbies {
+        let state = if l.is_racing() { "racing" } else { "intermission" };
+        sr_log!(
+            trace,
+            "core",
+            "  [{}] owner={} players={}/{} state={}",
+            name,
+            l.owner,
+            l.player_count(),
+            l.max_players,
+            state
+        );
+    }
+}
+
+async fn handle_connection(stream: TcpStream, peer_addr: String, cmd_tx: mpsc::Sender<LobbyCommand>) {
     let Ok(mut ws) = accept_async(stream).await else {
         sr_log!(trace, peer_addr, "WebSocket handshake failed for {}", peer_addr);
         return;
@@ -154,15 +224,13 @@ async fn handle_connection(
                         return;
                     }
                     Ok(ClientMessage::State { .. }) => {
-                        // sr_log!(error, "run", "Got State message before joining a lobby");
                         return;
                     }
                     Ok(ClientMessage::Request(request)) => {
-                        request_tx.send(request);
-                        // match handle_request(request, &peer_addr, ws, &lobbies).await {
-                        //     Some(returned_ws) => ws = returned_ws,
-                        //     None => return,
-                        // }
+                        match handle_request(request, &peer_addr, ws, &cmd_tx).await {
+                            Some(returned_ws) => ws = returned_ws,
+                            None => return,
+                        }
                     }
                 }
             }
@@ -190,12 +258,16 @@ async fn handle_request(
     request: RequestMessage,
     peer_addr: &str,
     mut ws: WebSocketStream<TcpStream>,
-    // lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
+    cmd_tx: &mpsc::Sender<LobbyCommand>,
 ) -> Option<WebSocketStream<TcpStream>> {
     match request {
         RequestMessage::FetchLobbyList => {
             sr_log!(info, peer_addr, "Fetching lobby list");
-            let list = build_lobby_list(lobbies).await;
+            let (resp_tx, resp_rx) = oneshot::channel();
+            if cmd_tx.send(LobbyCommand::FetchList { resp: resp_tx }).await.is_err() {
+                return None;
+            }
+            let list = resp_rx.await.unwrap_or_default();
             let response = ServerMessage::Response(Response::LobbyList(list));
             if let Err(e) = ws
                 .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
@@ -214,24 +286,19 @@ async fn handle_request(
             color,
         } => {
             sr_log!(info, peer_addr, "{} creating lobby {}", nickname, lobby_id);
-            let already_exists = lobbies.lock().await.contains_key(&lobby_id);
-            if already_exists {
-                sr_log!(trace, peer_addr, "Lobby {} already exists", lobby_id);
-                send_join_error(&mut ws, JoinError::LobbyAlreadyExists).await;
-                return None;
-            }
-            let lobby = Lobby::new(
-                lobby_id.clone(),
-                nickname.clone(),
-                Utc::now().format("%H:%M").to_string(),
-                min_players,
-                max_players,
-            );
-            lobbies
-                .lock()
-                .await
-                .insert(lobby_id.clone(), Arc::new(Mutex::new(lobby)));
-            join_lobby(lobby_id, nickname, color, ws, lobbies).await;
+            let (tx_stream, rx_stream) = ws.split();
+            let tx_out = spawn_ws_writer(tx_stream);
+            let _ = cmd_tx
+                .send(LobbyCommand::Create {
+                    lobby_id,
+                    nickname,
+                    min_players,
+                    max_players,
+                    color,
+                    tx_out,
+                    rx_stream,
+                })
+                .await;
             None
         }
 
@@ -241,63 +308,18 @@ async fn handle_request(
             color,
         } => {
             sr_log!(info, peer_addr, "{} joining lobby {}", nickname, lobby_id);
-            join_lobby(lobby_id, nickname, color, ws, lobbies).await;
+            let (tx_stream, rx_stream) = ws.split();
+            let tx_out = spawn_ws_writer(tx_stream);
+            let _ = cmd_tx
+                .send(LobbyCommand::Join {
+                    lobby_id,
+                    nickname,
+                    color,
+                    tx_out,
+                    rx_stream,
+                })
+                .await;
             None
         }
-    }
-}
-
-async fn build_lobby_list(lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) -> Vec<LobbyInfo> {
-    let arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
-        let lock = lobbies.lock().await;
-        lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-    };
-    let mut list = Vec::with_capacity(arcs.len());
-    for (name, arc) in arcs {
-        let l = arc.lock().await;
-        list.push(LobbyInfo {
-            name,
-            owner: l.owner.clone(),
-            start_time: l.start_time.clone(),
-            player_count: l.player_count(),
-            min_players: l.min_players,
-            max_players: l.max_players,
-            racing: l.is_racing(),
-        });
-    }
-    list
-}
-
-async fn send_join_error(ws: &mut WebSocketStream<TcpStream>, error: JoinError) {
-    let msg = ServerMessage::Response(Response::LobbyJoined {
-        track_id: 0,
-        race_ongoing: false,
-        min_players: 0,
-        max_players: 0,
-        error: Some(error),
-    });
-    let _ = ws
-        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-        .await;
-}
-
-async fn join_lobby(
-    lobby_id: String,
-    nickname: String,
-    color: ColorProto,
-    mut ws: WebSocketStream<TcpStream>,
-    lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
-) {
-    let lobby_arc = lobbies.lock().await.get(&lobby_id).cloned();
-    let Some(lobby_arc) = lobby_arc else {
-        sr_log!(trace, "join", "Lobby {} not found", lobby_id);
-        send_join_error(&mut ws, JoinError::LobbyNotFound).await;
-        return;
-    };
-    let mut guard = lobby_arc.lock().await;
-    let result = guard.join(nickname, color, ws).await;
-    drop(guard);
-    if let Err(e) = result {
-        sr_log!(trace, "join", "Join failed for {}: {}", lobby_id, e);
     }
 }

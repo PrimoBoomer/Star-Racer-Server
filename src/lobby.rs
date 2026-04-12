@@ -7,7 +7,7 @@ use crate::{
     sr_log, Result,
 };
 use cgmath::Vector3;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::SplitStream, SinkExt, StreamExt};
 use nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion};
 use rapier3d_f64::{
     math::{Pose, Vec3, Vector},
@@ -143,34 +143,26 @@ const CAR_COLLISION: InteractionGroups =
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
 const DRIFT_LINEAR_DAMPING: f64 = 0.18;
 
-// ── Race / lap constants ───────────────────────────────────────────────────────
-
-/// Number of laps required to win the race.
 const LAPS_TO_WIN: u8 = 3;
-/// X coordinate of the finish line (matches spawn point x from level.tscn).
+
 const LAP_FINISH_X: f64 = 145.0;
-/// Half-width of the detection zone on the X axis (covers full track width).
+
 const LAP_FINISH_X_HALF: f64 = 55.0;
-/// Cars must cross z > LAP_POSITIVE_Z before a finish-line crossing counts.
-/// Prevents the first step from the spawn (z=0 → z<0) being counted as a lap.
+
 const LAP_POSITIVE_Z: f64 = 50.0;
-/// X coordinate of the halfway checkpoint (opposite side of the track from the finish).
+
 const CHECKPOINT_X: f64 = -145.0;
-/// Half-width of the checkpoint detection zone on the X axis.
+
 const CHECKPOINT_X_HALF: f64 = 55.0;
-/// Seconds after the first finisher before the race is forcibly ended.
+
 const FINISH_WAIT_SECS: f64 = 30.0;
 
-// ── Racer ─────────────────────────────────────────────────────────────────────
-
-/// Latest input snapshot received from the client.
-/// Persists between frames so the car keeps moving if no message arrives.
 #[derive(Default, Clone, Copy)]
 struct PlayerInput {
     throttle: bool,
-    /// Analog left-steer value in [0, 1].
+
     steer_left: f64,
-    /// Analog right-steer value in [0, 1].
+
     steer_right: f64,
     star_drift: bool,
 }
@@ -179,7 +171,7 @@ pub(crate) struct Racer {
     nickname: String,
     racing: bool,
     color: ColorProto,
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    tx: tokio::sync::mpsc::UnboundedSender<Message>,
     rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
     idx: u8,
     rigid_body: RigidBodyHandle,
@@ -196,7 +188,7 @@ impl Racer {
         nickname: String,
         idx: u8,
         color: ColorProto,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tx: tokio::sync::mpsc::UnboundedSender<Message>,
         rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
         handle: RigidBodyHandle,
     ) -> Self {
@@ -223,15 +215,11 @@ enum PlayerEvent {
     Message(ClientMessage),
 }
 
-// ── Lobby state machine ───────────────────────────────────────────────────────
-
 enum State {
     Intermission,
     Starting,
     Racing,
 }
-
-// ── Lobby ─────────────────────────────────────────────────────────────────────
 
 pub struct Lobby {
     name: String,
@@ -278,39 +266,35 @@ impl Lobby {
         lobby
     }
 
-    /// Colliders aligned with `Star-Racer-Client/tracks/track/Track.tscn` (`Physical/*`).
     fn create_track(&mut self) {
-        fn godot_transform_to_isometry(
-            xx: f64,
-            xy: f64,
-            xz: f64,
-            yx: f64,
-            yy: f64,
-            yz: f64,
-            zx: f64,
-            zy: f64,
-            zz: f64,
-            ox: f64,
-            oy: f64,
-            oz: f64,
-        ) -> Isometry3<f64> {
-            let m = Matrix3::new(xx, yx, zx, xy, yy, zy, xz, yz, zz);
+        fn godot_transform_to_isometry(basis: [[f64; 3]; 3], origin: [f64; 3]) -> Isometry3<f64> {
+            let m = Matrix3::new(
+                basis[0][0],
+                basis[1][0],
+                basis[2][0],
+                basis[0][1],
+                basis[1][1],
+                basis[2][1],
+                basis[0][2],
+                basis[1][2],
+                basis[2][2],
+            );
             let rot = Rotation3::from_matrix_eps(&m, 1.0e-8, 100, Rotation3::identity());
             Isometry3::from_parts(
-                Translation3::new(ox, oy, oz),
+                Translation3::new(origin[0], origin[1], origin[2]),
                 UnitQuaternion::from_rotation_matrix(&rot),
             )
         }
 
         let floor = ColliderBuilder::cuboid(250.0, 0.5, 250.0)
-            .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 0., -0.5, 0.).into())
+            .position(godot_transform_to_isometry([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., -0.5, 0.]).into())
             .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
         self.physics.collider_set.insert(floor);
 
         let wall_center = ColliderBuilder::cuboid(90.0, 2.5, 90.0)
-            .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 0., 2.5, 0.).into())
+            .position(godot_transform_to_isometry([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 2.5, 0.]).into())
             .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
@@ -321,7 +305,7 @@ impl Lobby {
         let hz = 25.0_f64;
 
         let wall_n = ColliderBuilder::cuboid(hx, hy, hz)
-            .position(godot_transform_to_isometry(1., 0., 0., 0., 1., 0., 0., 0., 1., 25., 2.5, -225.).into())
+            .position(godot_transform_to_isometry([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [25., 2.5, -225.]).into())
             .collision_groups(WALL_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
@@ -330,18 +314,8 @@ impl Lobby {
         let wall_e = ColliderBuilder::cuboid(hx, hy, hz)
             .position(
                 godot_transform_to_isometry(
-                    -4.371139e-08,
-                    0.,
-                    -1.,
-                    0.,
-                    1.,
-                    0.,
-                    1.,
-                    0.,
-                    -4.371139e-08,
-                    -225.,
-                    2.5,
-                    -25.,
+                    [[-4.371139e-08, 0., -1.], [0., 1., 0.], [1., 0., -4.371139e-08]],
+                    [-225., 2.5, -25.],
                 )
                 .into(),
             )
@@ -353,18 +327,8 @@ impl Lobby {
         let wall_s = ColliderBuilder::cuboid(hx, hy, hz)
             .position(
                 godot_transform_to_isometry(
-                    -1.,
-                    0.,
-                    -8.742278e-08,
-                    0.,
-                    1.,
-                    0.,
-                    8.742278e-08,
-                    0.,
-                    -1.,
-                    -25.,
-                    2.5,
-                    225.,
+                    [[-1., 0., -8.742278e-08], [0., 1., 0.], [8.742278e-08, 0., -1.]],
+                    [-25., 2.5, 225.],
                 )
                 .into(),
             )
@@ -376,18 +340,8 @@ impl Lobby {
         let wall_w = ColliderBuilder::cuboid(hx, hy, hz)
             .position(
                 godot_transform_to_isometry(
-                    -4.371139e-08,
-                    0.,
-                    1.,
-                    0.,
-                    1.,
-                    0.,
-                    -1.,
-                    0.,
-                    -4.371139e-08,
-                    225.,
-                    2.5,
-                    25.,
+                    [[-4.371139e-08, 0., 1.], [0., 1., 0.], [-1., 0., -4.371139e-08]],
+                    [225., 2.5, 25.],
                 )
                 .into(),
             )
@@ -397,20 +351,19 @@ impl Lobby {
         self.physics.collider_set.insert(wall_w);
     }
 
-    // ── Public API ──────────────────────────────────────────────────────────
-
-    pub async fn join(
+    pub fn join(
         &mut self,
         nickname: String,
         color: ColorProto,
-        mut ws_stream: WebSocketStream<TcpStream>,
+        tx_out: tokio::sync::mpsc::UnboundedSender<Message>,
+        rx_stream: SplitStream<WebSocketStream<TcpStream>>,
     ) -> Result<()> {
         if self.racers.contains_key(&nickname) {
-            send_join_error(&mut ws_stream, JoinError::NicknameAlreadyUsed).await;
+            send_join_error(&tx_out, JoinError::NicknameAlreadyUsed);
             return Err(Error::ClientNicknameAlreadyUsed);
         }
         if self.racers.len() >= self.max_players as usize {
-            send_join_error(&mut ws_stream, JoinError::LobbyFull).await;
+            send_join_error(&tx_out, JoinError::LobbyFull);
             return Err(Error::ClientLobbyFull);
         }
 
@@ -432,26 +385,7 @@ impl Lobby {
             max_players: self.max_players,
             error: None,
         });
-        ws_stream
-            .send(Message::Text(serde_json::to_string(&join_msg).unwrap().into()))
-            .await
-            .unwrap();
-
-        let (tx_stream, rx_stream) = ws_stream.split();
-        // Do NOT send RaceStarted to late joiners — they spectate the current race
-        // and join as a full participant on the next one.
-
-        // Writer task: drains the outgoing channel and sends to the WebSocket sink.
-        // This keeps all I/O outside the lobby mutex — update() is now fully sync.
-        let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<String>();
-        tokio::spawn(async move {
-            let mut sink = tx_stream;
-            while let Some(msg) = rx_out.recv().await {
-                if sink.send(Message::Text(msg.into())).await.is_err() {
-                    break;
-                }
-            }
-        });
+        let _ = tx_out.send(serialize_server_message(&join_msg));
 
         let (tx_channel, rx_channel) = crossbeam::channel::unbounded::<PlayerEvent>();
         launch_client_reader(nickname.clone(), tx_channel, rx_stream);
@@ -467,8 +401,7 @@ impl Lobby {
         if self.racers.is_empty() {
             return false;
         }
-        // Step physics first so the broadcast reflects the state *after* inputs are
-        // integrated — clients receive the current frame, not the previous one.
+
         self.physics.step(delta);
         self.physics.drain_collision_events();
         self.check_lap_crossings();
@@ -485,18 +418,12 @@ impl Lobby {
         matches!(self.state, State::Racing)
     }
 
-    // ── Private helpers ─────────────────────────────────────────────────────
-
     fn process_player_events(&mut self, delta: f64) {
         let mut to_remove = Vec::new();
         let is_racing = self.is_racing();
         let racer_count = self.racers.len();
 
         for (nickname, racer) in &mut self.racers {
-            // Drain all queued messages, keeping only the latest input snapshot.
-            // ClientMessage::State is a *state* frame, not an event: multiple messages
-            // in the same tick just mean the channel buffered several snapshots.
-            // Last-wins is correct: the most recent snapshot is the player's current intent.
             let mut should_remove = false;
             while let Ok(event) = racer.rx_channel.try_recv() {
                 match event {
@@ -509,7 +436,7 @@ impl Lobby {
                             racer_count.saturating_sub(1)
                         );
                         should_remove = true;
-                        break; // stop processing events for a racer being removed
+                        break;
                     }
                     PlayerEvent::Message(ClientMessage::State {
                         throttle,
@@ -517,7 +444,6 @@ impl Lobby {
                         steer_right,
                         star_drift,
                     }) => {
-                        // Overwrite with the freshest snapshot; older ones are stale.
                         racer.input = PlayerInput {
                             throttle,
                             steer_left,
@@ -540,32 +466,19 @@ impl Lobby {
 
             let rb = self.physics.get_mut(racer.rigid_body).unwrap();
 
-            // Apply the latest known input once per physics tick.
-            // Drift only engages above a minimum speed — at low speed the huge yaw
-            // rate target spins the car in place with no lateral velocity to resist it.
             let speed = rb.linvel().length();
             let is_drifting = racer.input.star_drift && speed > 3.0;
             rb.reset_forces(true);
 
-            // Car axes — computed once, shared by throttle, steering and grip.
-            // forward = local +Z in world; thrust is -forward (car moves in -Z like Godot convention).
             let forward = *rb.rotation() * Vec3::new(0., 0., 1.);
-            // forward_speed: positive when car moves in its actual travel direction (-Z).
-            // Must negate because forward points +Z but motion is in -Z.
+
             let forward_speed = -forward.dot(rb.linvel());
 
-            // ── Throttle ──────────────────────────────────────────────────────
             if racer.input.throttle {
                 rb.add_force(-forward * THROTTLE_FORCE, true);
             }
 
-            // ── Steering: P-controller on yaw rate ────────────────────────────
-            // We drive yaw rate toward a target rather than setting it directly.
-            // This gives a torque build-up feel (arcade) while remaining snappy.
-            // Without drift the target is low → the car can barely corner on its own.
-            // With drift the target triples → tight corners become possible.
             let steer = racer.input.steer_right - racer.input.steer_left;
-            // Mirror client: invert steer when going backward so controls match apparent travel.
 
             let effective_steer = if forward_speed >= -0.5 { steer } else { -steer };
             let max_turn = if is_drifting {
@@ -573,25 +486,18 @@ impl Lobby {
             } else {
                 MAX_TURN_RATE_GRIP
             };
-            // Positive steer = right = negative Y in right-hand Y-up.
+
             let target_yaw = -effective_steer * max_turn;
             let yaw_error = target_yaw - rb.angvel().y;
-            // apply_torque_impulse(τ × dt) = Δω = τ × dt / I — one-shot per step, no accumulation.
-            // Equivalent to Godot's apply_torque() which auto-resets each physics frame.
+
             rb.apply_torque_impulse(Vec3::new(0., yaw_error * STEER_P_GAIN * delta, 0.), true);
 
-            // ── Lateral grip ──────────────────────────────────────────────────
-            // Cancel a fraction of the velocity that is perpendicular to the car's
-            // nose each step.  High grip → velocity always aligns with facing direction
-            // (the car tracks its nose, tight cornering is impossible without rotating
-            // the car first).  Low grip (drift) → car slides freely sideways.
             let right = *rb.rotation() * Vec3::new(1., 0., 0.);
             let lateral_speed = right.dot(rb.linvel());
             let grip_cancel = if is_drifting { LATERAL_DRIFT } else { LATERAL_GRIP };
             let mass = rb.mass();
             rb.apply_impulse(-right * lateral_speed * mass * grip_cancel, true);
 
-            // ── Linear damping ────────────────────────────────────────────────
             rb.set_linear_damping(if is_drifting {
                 DRIFT_LINEAR_DAMPING
             } else {
@@ -613,28 +519,27 @@ impl Lobby {
         }
         self.sync_timer = 0.;
 
-        let states: Vec<PlayerState> = self
-            .racers
-            .iter()
-            .filter_map(|(nickname, racer)| {
-                let rb = self.physics.get(racer.rigid_body)?;
-                let t = rb.translation();
-                let r = rb.rotation();
-                Some(PlayerState {
-                    nickname: nickname.clone(),
-                    racing: racer.racing,
-                    laps: racer.laps,
-                    position: Vec3Proto { x: t.x, y: t.y, z: t.z },
-                    rotation: QuatProto {
-                        x: r.x,
-                        y: r.y,
-                        z: r.z,
-                        w: r.w,
-                    },
-                    color: racer.color,
-                })
-            })
-            .collect();
+        let mut states = Vec::with_capacity(self.racers.len());
+        for (nickname, racer) in &self.racers {
+            let Some(rb) = self.physics.get(racer.rigid_body) else {
+                continue;
+            };
+            let t = rb.translation();
+            let r = rb.rotation();
+            states.push(PlayerState {
+                nickname: nickname.clone(),
+                racing: racer.racing,
+                laps: racer.laps,
+                position: Vec3Proto { x: t.x, y: t.y, z: t.z },
+                rotation: QuatProto {
+                    x: r.x,
+                    y: r.y,
+                    z: r.z,
+                    w: r.w,
+                },
+                color: racer.color,
+            });
+        }
 
         self.broadcast_message(ServerMessage::State(LobbyState::Players(states)), false);
     }
@@ -643,17 +548,17 @@ impl Lobby {
         match self.state {
             State::Intermission => {
                 if !self.intermission(delta) {
-                    self.to_starting();
+                    self.enter_starting();
                 }
             }
             State::Starting => {
                 if !self.starting(delta) {
-                    self.to_race();
+                    self.enter_race();
                 }
             }
             State::Racing => {
                 if !self.race(delta) {
-                    self.to_intermission();
+                    self.enter_intermission();
                 }
             }
         }
@@ -681,7 +586,7 @@ impl Lobby {
         false
     }
 
-    fn to_starting(&mut self) {
+    fn enter_starting(&mut self) {
         sr_log!(
             info,
             &self.name,
@@ -706,9 +611,9 @@ impl Lobby {
                 y_rotation: self.spawn_y_rotation,
                 position: spawn_pos,
             };
-            let _ = racer
-                .tx
-                .send(serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceAboutToStart(spawn_info))).unwrap());
+            let _ = racer.tx.send(serialize_server_message(&ServerMessage::Event(
+                LobbyEvent::RaceAboutToStart(spawn_info),
+            )));
             racer.laps = 0;
             racer.prev_z = 0.0;
             racer.crossed_positive_z = false;
@@ -728,10 +633,9 @@ impl Lobby {
             self.sync_countdown_timer += delta;
             if self.sync_countdown_timer > 1. {
                 self.sync_countdown_timer = 0.;
-                // Guard against negative time if a large delta pushed start_timer past 5.0
-                // within this same frame.
+
                 let time = (5. - self.start_timer).max(0.);
-                let msg = serde_json::to_string(&ServerMessage::Event(LobbyEvent::Countdown { time })).unwrap();
+                let msg = serialize_server_message(&ServerMessage::Event(LobbyEvent::Countdown { time }));
                 for racer in self.racers.values() {
                     let _ = racer.tx.send(msg.clone());
                 }
@@ -741,7 +645,7 @@ impl Lobby {
         false
     }
 
-    fn to_race(&mut self) {
+    fn enter_race(&mut self) {
         self.sync_countdown_timer = 0.;
         self.start_timer = 0.;
         self.broadcast_message(ServerMessage::Event(LobbyEvent::RaceStarted(())), false);
@@ -755,25 +659,27 @@ impl Lobby {
     fn race(&mut self, delta: f64) -> bool {
         self.race_timer += delta;
 
-        // Count down after the first finisher arrives.
         if self.finish_timer > 0.0 {
             self.finish_timer -= delta;
             if self.finish_timer <= 0.0 {
-                return false; // grace period expired
+                return false;
             }
         }
 
-        // End immediately once every racing player has finished.
-        let racing: Vec<_> = self.racers.values().filter(|r| r.racing).collect();
-        if !racing.is_empty() && racing.iter().all(|r| r.finished) {
-            return false;
+        let mut has_active_racer = false;
+        for racer in self.racers.values() {
+            if racer.racing {
+                has_active_racer = true;
+                if !racer.finished {
+                    return true;
+                }
+            }
         }
 
-        true
+        !has_active_racer
     }
 
-    fn to_intermission(&mut self) {
-        // Rankings: finishers in crossing order, then DNF players sorted by name.
+    fn enter_intermission(&mut self) {
         let mut rankings = self.finishers.clone();
         let mut dnf: Vec<String> = self
             .racers
@@ -808,45 +714,33 @@ impl Lobby {
     }
 
     fn check_lap_crossings(&mut self) {
-        // Collect position snapshots first to release the immutable borrow on self.physics
-        // before we mutate racer state or self.finishers.
-        let snapshots: Vec<(String, f64, f64)> = self
-            .racers
-            .iter()
-            .filter_map(|(name, racer)| {
-                self.physics
-                    .get(racer.rigid_body)
-                    .map(|rb| (name.clone(), rb.translation().x, rb.translation().z))
-            })
-            .collect();
+        let physics = &self.physics;
+        let finishers = &mut self.finishers;
+        let finish_timer = &mut self.finish_timer;
 
-        for (nickname, x, z) in snapshots {
-            let racer = match self.racers.get_mut(&nickname) {
-                Some(r) => r,
-                None => continue,
+        for racer in self.racers.values_mut() {
+            let Some(rb) = physics.get(racer.rigid_body) else {
+                continue;
             };
+            let translation = rb.translation();
+            let x = translation.x;
+            let z = translation.z;
 
             if racer.finished || !racer.racing {
                 racer.prev_z = z;
                 continue;
             }
 
-            // Gate: car must pass LAP_POSITIVE_Z before any finish-line crossing counts.
-            // This prevents the first physics step from z=0 to z<0 (at spawn) being misread.
             if z > LAP_POSITIVE_Z {
                 racer.crossed_positive_z = true;
             }
 
-            // Halfway checkpoint (opposite side of the track from the finish line).
-            // The car must cross this before a finish-line crossing counts as a lap,
-            // preventing players from driving back and forth across the finish line.
             if (x - CHECKPOINT_X).abs() < CHECKPOINT_X_HALF {
                 racer.crossed_halfway = true;
             }
 
             let prev_z = racer.prev_z;
-            // Clockwise lap: car crosses finish line going from +Z side to −Z side.
-            // X strip: |x − LAP_FINISH_X| < LAP_FINISH_X_HALF  (covers full track width).
+
             if racer.crossed_positive_z
                 && racer.crossed_halfway
                 && prev_z >= 0.0
@@ -854,19 +748,18 @@ impl Lobby {
                 && (x - LAP_FINISH_X).abs() < LAP_FINISH_X_HALF
             {
                 racer.laps += 1;
-                racer.crossed_positive_z = false; // must reach positive-Z again for the next lap
-                racer.crossed_halfway = false; // must pass checkpoint again for the next lap
+                racer.crossed_positive_z = false;
+                racer.crossed_halfway = false;
 
                 sr_log!(info, &racer.nickname, "Lap {}/{}", racer.laps, LAPS_TO_WIN);
 
                 if racer.laps >= LAPS_TO_WIN {
                     racer.finished = true;
-                    let name = racer.nickname.clone();
-                    self.finishers.push(name);
-                    if self.finish_timer == 0.0 {
-                        self.finish_timer = FINISH_WAIT_SECS;
+                    finishers.push(racer.nickname.clone());
+                    if *finish_timer == 0.0 {
+                        *finish_timer = FINISH_WAIT_SECS;
                     }
-                    continue; // skip prev_z update — racer is finished
+                    continue;
                 }
             }
 
@@ -874,13 +767,13 @@ impl Lobby {
         }
     }
 
-    fn broadcast_message(&mut self, message: ServerMessage, for_racing_players: bool) {
-        let json = serde_json::to_string(&message).unwrap();
+    fn broadcast_message(&self, message: ServerMessage, for_racing_players: bool) {
+        let message = serialize_server_message(&message);
         for racer in self.racers.values() {
             if for_racing_players && !racer.racing {
                 continue;
             }
-            let _ = racer.tx.send(json.clone());
+            let _ = racer.tx.send(message.clone());
         }
     }
 
@@ -899,9 +792,11 @@ impl Lobby {
     }
 }
 
-// ── WebSocket reader task ─────────────────────────────────────────────────────
+fn serialize_server_message(message: &ServerMessage) -> Message {
+    Message::Text(serde_json::to_string(message).unwrap().into())
+}
 
-async fn send_join_error(ws_stream: &mut WebSocketStream<TcpStream>, error: JoinError) {
+pub fn send_join_error(tx_out: &tokio::sync::mpsc::UnboundedSender<Message>, error: JoinError) {
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
@@ -909,9 +804,22 @@ async fn send_join_error(ws_stream: &mut WebSocketStream<TcpStream>, error: Join
         max_players: 0,
         error: Some(error),
     });
-    let _ = ws_stream
-        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
-        .await;
+    let _ = tx_out.send(serialize_server_message(&msg));
+}
+
+pub fn spawn_ws_writer(
+    tx_stream: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
+) -> tokio::sync::mpsc::UnboundedSender<Message> {
+    let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    tokio::spawn(async move {
+        let mut sink = tx_stream;
+        while let Some(msg) = rx_out.recv().await {
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    tx_out
 }
 
 fn launch_client_reader(

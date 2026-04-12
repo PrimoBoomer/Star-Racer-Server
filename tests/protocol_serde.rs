@@ -3,8 +3,6 @@ use star_racer_server::protocol::{
     Response, ServerMessage, SpawnInfo, Vec3Proto,
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 fn red() -> ColorProto {
     ColorProto { x: 1.0, y: 0.0, z: 0.0 }
 }
@@ -29,8 +27,6 @@ fn ser<T: serde::Serialize>(v: &T) -> String {
 fn de<T: serde::de::DeserializeOwned>(s: &str) -> T {
     serde_json::from_str(s).unwrap()
 }
-
-// ── Vec3Proto / QuatProto ─────────────────────────────────────────────────────
 
 #[test]
 fn vec3_serializes() {
@@ -63,8 +59,6 @@ fn quat_deserializes() {
     assert_eq!(q.w, 1.0);
 }
 
-// ── JoinError ─────────────────────────────────────────────────────────────────
-
 #[test]
 fn join_error_variants_serialize_as_strings() {
     assert_eq!(ser(&JoinError::NicknameAlreadyUsed), r#""NicknameAlreadyUsed""#);
@@ -86,8 +80,6 @@ fn join_error_roundtrip() {
         assert_eq!(ser(&back), json);
     }
 }
-
-// ── ClientMessage ─────────────────────────────────────────────────────────────
 
 #[test]
 fn client_fetch_lobby_list_serializes() {
@@ -177,8 +169,6 @@ fn malformed_json_fails() {
     assert!(result.is_err());
 }
 
-// ── ServerMessage — Response ──────────────────────────────────────────────────
-
 #[test]
 fn server_lobby_list_empty_serializes() {
     let msg = ServerMessage::Response(Response::LobbyList(vec![]));
@@ -254,8 +244,6 @@ fn server_lobby_joined_all_error_variants_serialize() {
     }
 }
 
-// ── ServerMessage — Events ────────────────────────────────────────────────────
-
 #[test]
 fn server_countdown_serializes() {
     let msg = ServerMessage::Event(LobbyEvent::Countdown { time: 3.0 });
@@ -288,7 +276,10 @@ fn server_race_finished_serializes() {
         winner: "Alice".into(),
         rankings: vec![],
     });
-    assert_eq!(ser(&msg), r#"{"Event":{"RaceFinished":{"winner":"Alice","rankings":[]}}}"#);
+    assert_eq!(
+        ser(&msg),
+        r#"{"Event":{"RaceFinished":{"winner":"Alice","rankings":[]}}}"#
+    );
 }
 
 #[test]
@@ -302,8 +293,6 @@ fn server_player_left_serializes() {
     let msg = ServerMessage::Event(LobbyEvent::PlayerLeft("Bob".into()));
     assert_eq!(ser(&msg), r#"{"Event":{"PlayerLeft":"Bob"}}"#);
 }
-
-// ── ServerMessage — State ─────────────────────────────────────────────────────
 
 #[test]
 fn server_waiting_for_players_serializes() {
@@ -335,8 +324,6 @@ fn server_players_state_with_player_serializes() {
     assert_eq!(p["rotation"]["w"], 1.0);
     assert_eq!(p["color"]["x"], 1.0);
 }
-
-// ── Full roundtrip ────────────────────────────────────────────────────────────
 
 #[test]
 fn server_lobby_list_roundtrip() {
