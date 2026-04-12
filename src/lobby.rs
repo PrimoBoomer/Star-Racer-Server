@@ -23,9 +23,6 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 
-// ── Physics world ─────────────────────────────────────────────────────────────
-
-/// All Rapier state in one place, separate from game logic.
 struct PhysicsWorld {
     rigid_body_set: RigidBodySet,
     collider_set: ColliderSet,
@@ -88,26 +85,19 @@ impl PhysicsWorld {
     }
 
     fn drain_collision_events(&mut self) {
-        while let Ok(_event) = self.collision_recv.try_recv() {
-            // Collision events intentionally not logged (high frequency).
-        }
+        while let Ok(_event) = self.collision_recv.try_recv() {}
     }
 
     fn insert_body(&mut self, pos: Vec3Proto) -> RigidBodyHandle {
         let rb = RigidBodyBuilder::dynamic()
             .translation(Vec3::new(pos.x, pos.y, pos.z))
-            // Linear damping is overridden each frame by the input handler.
-            // Angular damping is intentionally low: the P-controller handles settling.
             .linear_damping(NORMAL_LINEAR_DAMPING)
             .angular_damping(0.5)
             .build();
         let handle = self.rigid_body_set.insert(rb);
-        // Dimensions match Godot's player BoxShape3D(3.5, 2.8, 4.4) → half-extents (1.75, 1.4, 2.2).
-        // density = target_mass / volume = 1000 / (3.5 × 2.8 × 4.4) ≈ 23.19 kg/m³
-        // This gives mass ≈ 1000 kg AND a proper inertia tensor (needed for angular physics).
         let collider = ColliderBuilder::cuboid(1.75, 1.4, 2.2)
             .density(23.19)
-            .friction(0.0) // traction is handled explicitly; contact friction would fight throttle
+            .friction(0.0)
             .collision_groups(CAR_COLLISION)
             .active_events(ActiveEvents::COLLISION_EVENTS)
             .build();
@@ -136,45 +126,21 @@ impl PhysicsWorld {
     }
 }
 
-// ── Car physics constants ──────────────────────────────────────────────────────
-
-/// Forward thrust force in Newtons.
 const THROTTLE_FORCE: f64 = 10_000.0;
-
-// Steering: P-controller drives yaw rate toward a target.
-// The torque applied each step = STEER_P_GAIN × (target_yaw_rate − current_yaw_rate).
-/// Target yaw rate (rad/s) at full steering without drift.  Tight: car can barely corner.
 const MAX_TURN_RATE_GRIP: f64 = 1.2;
-/// Target yaw rate (rad/s) at full steering while drifting.  Much higher: corners become possible.
 const MAX_TURN_RATE_DRIFT: f64 = 3.2;
-/// P-controller gain.  Higher = snappier steering response.
 const STEER_P_GAIN: f64 = 25_000.0;
-
-// Lateral grip: each physics step we apply an impulse that cancels a fraction
-// of the velocity component perpendicular to the car's nose.
-// 1.0 = perfect grip (velocity always aligned with nose), 0.0 = hovercraft.
-/// Fraction of lateral velocity cancelled per step in normal driving (very grippy).
 const LATERAL_GRIP: f64 = 0.90;
-/// Fraction cancelled while drifting (almost none → car slides freely).
 const LATERAL_DRIFT: f64 = 0.08;
-
-// ── Collision groups ──────────────────────────────────────────────────────────
-// GROUP_1 = walls/floor, GROUP_2 = cars.
-// Cars collide with walls but NOT with each other.
-
-/// Walls belong to GROUP_1 and interact with both groups.
 const WALL_COLLISION: InteractionGroups = InteractionGroups::new(
     Group::GROUP_1,
     Group::GROUP_1.union(Group::GROUP_2),
     InteractionTestMode::And,
 );
-/// Cars belong to GROUP_2 and only interact with GROUP_1 (walls).
 const CAR_COLLISION: InteractionGroups =
     InteractionGroups::new(Group::GROUP_2, Group::GROUP_1, InteractionTestMode::And);
 
-/// Linear damping during normal driving.
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
-/// Reduced linear damping while drifting.
 const DRIFT_LINEAR_DAMPING: f64 = 0.18;
 
 // ── Race / lap constants ───────────────────────────────────────────────────────
@@ -740,9 +706,9 @@ impl Lobby {
                 y_rotation: self.spawn_y_rotation,
                 position: spawn_pos,
             };
-            let _ = racer.tx.send(
-                serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceAboutToStart(spawn_info))).unwrap(),
-            );
+            let _ = racer
+                .tx
+                .send(serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceAboutToStart(spawn_info))).unwrap());
             racer.laps = 0;
             racer.prev_z = 0.0;
             racer.crossed_positive_z = false;

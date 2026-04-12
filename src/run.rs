@@ -7,7 +7,10 @@ use crate::{
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, sync::Arc};
-use tokio::{net::TcpListener, net::TcpStream, sync::Mutex};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{oneshot, Mutex},
+};
 use tokio_tungstenite::{accept_async, WebSocketStream};
 use tungstenite::Message;
 
@@ -22,25 +25,30 @@ pub async fn run_with_listener(listener: TcpListener) -> Result<()> {
 
     let lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    spawn_game_loop(lobbies.clone());
+    let (request_tx, request_rx) = tokio::sync::oneshot::channel::<RequestMessage>();
+    spawn_game_loop(lobbies.clone(), request_rx);
     spawn_debug_logger(lobbies.clone());
 
     loop {
         let (stream, peer_addr) = listener.accept().await.map_err(Error::TcpError)?;
         sr_log!(trace, peer_addr, ">TCP");
         let lobbies_cln = lobbies.clone();
-        tokio::spawn(handle_connection(stream, peer_addr.to_string(), lobbies_cln));
+        tokio::spawn(handle_connection(
+            stream,
+            peer_addr.to_string(),
+            lobbies_cln,
+            request_tx,
+        ));
     }
 }
 
-// ── Background tasks ──────────────────────────────────────────────────────────
-
-/// Target physics/game tick rate.
 const FRAME_DURATION: std::time::Duration = std::time::Duration::from_millis(16); // ~60 Hz
-/// Maximum delta passed to physics to avoid instability after stalls.
 const MAX_DELTA_SECS: f64 = 0.1;
 
-fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
+fn spawn_game_loop(
+    lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
+    request_rx: tokio::sync::oneshot::Receiver<RequestMessage>,
+) {
     tokio::spawn(async move {
         let mut now = tokio::time::Instant::now();
         loop {
@@ -51,20 +59,14 @@ fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
             }
 
             let new_now = tokio::time::Instant::now();
-            // Clamp delta: if the server was stalled, don't feed a huge spike to physics.
             let delta = (new_now - now).as_secs_f64().min(MAX_DELTA_SECS);
             now = new_now;
 
-            // Snapshot the lobby arcs while holding the outer lock, then
-            // release it so connection handlers are not blocked during physics
-            // updates and WebSocket sends (which may .await for each client).
             let lobby_arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
                 let lock = lobbies.lock().await;
                 lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
 
-            // Spawn each lobby update as an independent task so the multi-thread
-            // runtime distributes physics steps and WS sends across OS threads.
             let handles: Vec<_> = lobby_arcs
                 .into_iter()
                 .map(|(name, arc)| {
@@ -74,6 +76,8 @@ fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
                     })
                 })
                 .collect();
+
+            // for lobby in lobbies {}
 
             let mut to_remove = Vec::new();
             for handle in handles {
@@ -91,8 +95,6 @@ fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
                 }
             }
 
-            // Sleep for the remainder of the frame budget so we target ~60 Hz and
-            // yield to other async tasks (connection handlers, readers) between ticks.
             let elapsed = now.elapsed();
             if let Some(remaining) = FRAME_DURATION.checked_sub(elapsed) {
                 tokio::time::sleep(remaining).await;
@@ -116,19 +118,25 @@ fn spawn_debug_logger(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
             for (name, arc) in arcs {
                 let l = arc.lock().await;
                 let state = if l.is_racing() { "racing" } else { "intermission" };
-                sr_log!(trace, "core", "  [{}] owner={} players={}/{} state={}",
-                    name, l.owner, l.player_count(), l.max_players, state);
+                sr_log!(
+                    trace,
+                    "core",
+                    "  [{}] owner={} players={}/{} state={}",
+                    name,
+                    l.owner,
+                    l.player_count(),
+                    l.max_players,
+                    state
+                );
             }
         }
     });
 }
 
-// ── Connection handler ────────────────────────────────────────────────────────
-
 async fn handle_connection(
     stream: TcpStream,
     peer_addr: String,
-    lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
+    request_tx: tokio::sync::oneshot::Sender<RequestMessage>,
 ) {
     let Ok(mut ws) = accept_async(stream).await else {
         sr_log!(trace, peer_addr, "WebSocket handshake failed for {}", peer_addr);
@@ -139,21 +147,22 @@ async fn handle_connection(
     loop {
         match ws.next().await {
             Some(Ok(Message::Text(text))) => {
-                match serde_json::from_str::<ClientMessage>(&text).map_err(Error::ClientInvalidJson) {
+                let msg = serde_json::from_str::<ClientMessage>(&text).map_err(Error::ClientInvalidJson);
+                match msg {
                     Err(e) => {
                         sr_log!(trace, peer_addr, "Bad JSON from {}: {}", peer_addr, e);
                         return;
                     }
                     Ok(ClientMessage::State { .. }) => {
-                        sr_log!(error, "run", "Got State message before joining a lobby");
+                        // sr_log!(error, "run", "Got State message before joining a lobby");
                         return;
                     }
                     Ok(ClientMessage::Request(request)) => {
-                        // handle_request consumes ws when joining a lobby (returns None)
-                        match handle_request(request, &peer_addr, ws, &lobbies).await {
-                            Some(returned_ws) => ws = returned_ws,
-                            None => return,
-                        }
+                        request_tx.send(request);
+                        // match handle_request(request, &peer_addr, ws, &lobbies).await {
+                        //     Some(returned_ws) => ws = returned_ws,
+                        //     None => return,
+                        // }
                     }
                 }
             }
@@ -177,26 +186,33 @@ async fn handle_connection(
     }
 }
 
-/// Returns `Some(ws)` to keep looping, `None` when the WebSocket was consumed
-/// (lobby join/create hand off ownership to the lobby task).
 async fn handle_request(
     request: RequestMessage,
     peer_addr: &str,
     mut ws: WebSocketStream<TcpStream>,
-    lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
+    // lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
 ) -> Option<WebSocketStream<TcpStream>> {
     match request {
         RequestMessage::FetchLobbyList => {
             sr_log!(info, peer_addr, "Fetching lobby list");
             let list = build_lobby_list(lobbies).await;
             let response = ServerMessage::Response(Response::LobbyList(list));
-            if let Err(e) = ws.send(Message::Text(serde_json::to_string(&response).unwrap().into())).await {
+            if let Err(e) = ws
+                .send(Message::Text(serde_json::to_string(&response).unwrap().into()))
+                .await
+            {
                 sr_log!(trace, peer_addr, "Send failed: {}", e);
             }
             Some(ws)
         }
 
-        RequestMessage::CreateLobby { lobby_id, nickname, min_players, max_players, color } => {
+        RequestMessage::CreateLobby {
+            lobby_id,
+            nickname,
+            min_players,
+            max_players,
+            color,
+        } => {
             sr_log!(info, peer_addr, "{} creating lobby {}", nickname, lobby_id);
             let already_exists = lobbies.lock().await.contains_key(&lobby_id);
             if already_exists {
@@ -211,12 +227,19 @@ async fn handle_request(
                 min_players,
                 max_players,
             );
-            lobbies.lock().await.insert(lobby_id.clone(), Arc::new(Mutex::new(lobby)));
+            lobbies
+                .lock()
+                .await
+                .insert(lobby_id.clone(), Arc::new(Mutex::new(lobby)));
             join_lobby(lobby_id, nickname, color, ws, lobbies).await;
             None
         }
 
-        RequestMessage::JoinLobby { lobby_id, nickname, color } => {
+        RequestMessage::JoinLobby {
+            lobby_id,
+            nickname,
+            color,
+        } => {
             sr_log!(info, peer_addr, "{} joining lobby {}", nickname, lobby_id);
             join_lobby(lobby_id, nickname, color, ws, lobbies).await;
             None
@@ -224,11 +247,7 @@ async fn handle_request(
     }
 }
 
-async fn build_lobby_list(
-    lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
-) -> Vec<LobbyInfo> {
-    // Snapshot the Arc handles while holding the outer lock, then release it
-    // before locking each inner lobby — same pattern as the game loop.
+async fn build_lobby_list(lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) -> Vec<LobbyInfo> {
     let arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
         let lock = lobbies.lock().await;
         lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -257,7 +276,9 @@ async fn send_join_error(ws: &mut WebSocketStream<TcpStream>, error: JoinError) 
         max_players: 0,
         error: Some(error),
     });
-    let _ = ws.send(Message::Text(serde_json::to_string(&msg).unwrap().into())).await;
+    let _ = ws
+        .send(Message::Text(serde_json::to_string(&msg).unwrap().into()))
+        .await;
 }
 
 async fn join_lobby(
@@ -267,7 +288,6 @@ async fn join_lobby(
     mut ws: WebSocketStream<TcpStream>,
     lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
 ) {
-    // Clone the Arc so we can drop the HashMap lock before awaiting on the inner Mutex.
     let lobby_arc = lobbies.lock().await.get(&lobby_id).cloned();
     let Some(lobby_arc) = lobby_arc else {
         sr_log!(trace, "join", "Lobby {} not found", lobby_id);
@@ -281,4 +301,3 @@ async fn join_lobby(
         sr_log!(trace, "join", "Join failed for {}: {}", lobby_id, e);
     }
 }
-
