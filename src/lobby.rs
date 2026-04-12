@@ -7,7 +7,7 @@ use crate::{
     sr_log, Result,
 };
 use cgmath::Vector3;
-use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use nalgebra::{Isometry3, Matrix3, Rotation3, Translation3, UnitQuaternion};
 use rapier3d_f64::{
     math::{Pose, Vec3, Vector},
@@ -213,7 +213,7 @@ pub(crate) struct Racer {
     nickname: String,
     racing: bool,
     color: ColorProto,
-    tx_stream: SplitSink<WebSocketStream<TcpStream>, Message>,
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
     rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
     idx: u8,
     rigid_body: RigidBodyHandle,
@@ -230,7 +230,7 @@ impl Racer {
         nickname: String,
         idx: u8,
         color: ColorProto,
-        tx_stream: SplitSink<WebSocketStream<TcpStream>, Message>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
         rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
         handle: RigidBodyHandle,
     ) -> Self {
@@ -238,7 +238,7 @@ impl Racer {
             nickname,
             racing: false,
             color,
-            tx_stream,
+            tx,
             rx_channel,
             idx,
             rigid_body: handle,
@@ -475,16 +475,28 @@ impl Lobby {
         // Do NOT send RaceStarted to late joiners — they spectate the current race
         // and join as a full participant on the next one.
 
+        // Writer task: drains the outgoing channel and sends to the WebSocket sink.
+        // This keeps all I/O outside the lobby mutex — update() is now fully sync.
+        let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let mut sink = tx_stream;
+            while let Some(msg) = rx_out.recv().await {
+                if sink.send(Message::Text(msg.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         let (tx_channel, rx_channel) = crossbeam::channel::unbounded::<PlayerEvent>();
         launch_client_reader(nickname.clone(), tx_channel, rx_stream);
 
         let handle = self.physics.insert_body(Vec3Proto { x: 0., y: 0., z: 0. });
-        let racer = Racer::new(nickname.clone(), player_idx, color, tx_stream, rx_channel, handle);
+        let racer = Racer::new(nickname.clone(), player_idx, color, tx_out, rx_channel, handle);
         self.racers.insert(nickname, racer);
         Ok(())
     }
 
-    pub async fn update(&mut self, delta: f64) -> bool {
+    pub fn update(&mut self, delta: f64) -> bool {
         self.process_player_events(delta);
         if self.racers.is_empty() {
             return false;
@@ -494,8 +506,8 @@ impl Lobby {
         self.physics.step(delta);
         self.physics.drain_collision_events();
         self.check_lap_crossings();
-        self.broadcast_player_states(delta).await;
-        self.tick_state_machine(delta).await;
+        self.broadcast_player_states(delta);
+        self.tick_state_machine(delta);
         true
     }
 
@@ -628,7 +640,7 @@ impl Lobby {
         }
     }
 
-    async fn broadcast_player_states(&mut self, delta: f64) {
+    fn broadcast_player_states(&mut self, delta: f64) {
         self.sync_timer += delta;
         if self.sync_timer <= 0.05 {
             return;
@@ -637,17 +649,13 @@ impl Lobby {
 
         let states: Vec<PlayerState> = self
             .racers
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|nickname| {
-                let racer = self.racers.get(&nickname).unwrap();
-                let rb = self.physics.get(racer.rigid_body).unwrap();
+            .iter()
+            .filter_map(|(nickname, racer)| {
+                let rb = self.physics.get(racer.rigid_body)?;
                 let t = rb.translation();
                 let r = rb.rotation();
-                PlayerState {
-                    nickname,
+                Some(PlayerState {
+                    nickname: nickname.clone(),
                     racing: racer.racing,
                     laps: racer.laps,
                     position: Vec3Proto { x: t.x, y: t.y, z: t.z },
@@ -658,35 +666,34 @@ impl Lobby {
                         w: r.w,
                     },
                     color: racer.color,
-                }
+                })
             })
             .collect();
 
-        self.broadcast_message(ServerMessage::State(LobbyState::Players(states)), false)
-            .await;
+        self.broadcast_message(ServerMessage::State(LobbyState::Players(states)), false);
     }
 
-    async fn tick_state_machine(&mut self, delta: f64) {
+    fn tick_state_machine(&mut self, delta: f64) {
         match self.state {
             State::Intermission => {
-                if !self.intermission(delta).await {
-                    self.to_starting().await;
+                if !self.intermission(delta) {
+                    self.to_starting();
                 }
             }
             State::Starting => {
-                if !self.starting(delta).await {
-                    self.to_race().await;
+                if !self.starting(delta) {
+                    self.to_race();
                 }
             }
             State::Racing => {
                 if !self.race(delta) {
-                    self.to_intermission().await;
+                    self.to_intermission();
                 }
             }
         }
     }
 
-    async fn intermission(&mut self, delta: f64) -> bool {
+    fn intermission(&mut self, delta: f64) -> bool {
         if self.racers.len() < self.min_players as usize {
             self.intermission_timer += delta;
             if self.intermission_timer > 1. {
@@ -699,8 +706,7 @@ impl Lobby {
                     self.racers.len(),
                     self.min_players
                 );
-                self.broadcast_message(ServerMessage::State(LobbyState::WaitingForPlayers(waiting)), false)
-                    .await;
+                self.broadcast_message(ServerMessage::State(LobbyState::WaitingForPlayers(waiting)), false);
                 self.intermission_timer = 0.;
             }
             return true;
@@ -709,7 +715,7 @@ impl Lobby {
         false
     }
 
-    async fn to_starting(&mut self) {
+    fn to_starting(&mut self) {
         sr_log!(
             info,
             &self.name,
@@ -734,14 +740,9 @@ impl Lobby {
                 y_rotation: self.spawn_y_rotation,
                 position: spawn_pos,
             };
-            let _ = racer
-                .tx_stream
-                .send(Message::Text(
-                    serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceAboutToStart(spawn_info)))
-                        .unwrap()
-                        .into(),
-                ))
-                .await;
+            let _ = racer.tx.send(
+                serde_json::to_string(&ServerMessage::Event(LobbyEvent::RaceAboutToStart(spawn_info))).unwrap(),
+            );
             racer.laps = 0;
             racer.prev_z = 0.0;
             racer.crossed_positive_z = false;
@@ -755,7 +756,7 @@ impl Lobby {
         self.state = State::Starting;
     }
 
-    async fn starting(&mut self, delta: f64) -> bool {
+    fn starting(&mut self, delta: f64) -> bool {
         if self.start_timer < 5. {
             self.start_timer += delta;
             self.sync_countdown_timer += delta;
@@ -764,15 +765,9 @@ impl Lobby {
                 // Guard against negative time if a large delta pushed start_timer past 5.0
                 // within this same frame.
                 let time = (5. - self.start_timer).max(0.);
-                for racer in self.racers.values_mut() {
-                    let _ = racer
-                        .tx_stream
-                        .send(Message::Text(
-                            serde_json::to_string(&ServerMessage::Event(LobbyEvent::Countdown { time }))
-                                .unwrap()
-                                .into(),
-                        ))
-                        .await;
+                let msg = serde_json::to_string(&ServerMessage::Event(LobbyEvent::Countdown { time })).unwrap();
+                for racer in self.racers.values() {
+                    let _ = racer.tx.send(msg.clone());
                 }
             }
             return true;
@@ -780,11 +775,10 @@ impl Lobby {
         false
     }
 
-    async fn to_race(&mut self) {
+    fn to_race(&mut self) {
         self.sync_countdown_timer = 0.;
         self.start_timer = 0.;
-        self.broadcast_message(ServerMessage::Event(LobbyEvent::RaceStarted(())), false)
-            .await;
+        self.broadcast_message(ServerMessage::Event(LobbyEvent::RaceStarted(())), false);
         sr_log!(info, &self.name, "-> Racing ({} players)", self.racers.len());
         for racer in self.racers.values_mut() {
             racer.racing = true;
@@ -812,7 +806,7 @@ impl Lobby {
         true
     }
 
-    async fn to_intermission(&mut self) {
+    fn to_intermission(&mut self) {
         // Rankings: finishers in crossing order, then DNF players sorted by name.
         let mut rankings = self.finishers.clone();
         let mut dnf: Vec<String> = self
@@ -838,8 +832,7 @@ impl Lobby {
         self.broadcast_message(
             ServerMessage::Event(LobbyEvent::RaceFinished { winner, rankings }),
             false,
-        )
-        .await;
+        );
 
         for racer in self.racers.values_mut() {
             racer.racing = false;
@@ -915,13 +908,13 @@ impl Lobby {
         }
     }
 
-    async fn broadcast_message(&mut self, message: ServerMessage, for_racing_players: bool) {
+    fn broadcast_message(&mut self, message: ServerMessage, for_racing_players: bool) {
         let json = serde_json::to_string(&message).unwrap();
-        for racer in self.racers.values_mut() {
+        for racer in self.racers.values() {
             if for_racing_players && !racer.racing {
                 continue;
             }
-            let _ = racer.tx_stream.send(Message::Text(json.clone().into())).await;
+            let _ = racer.tx.send(json.clone());
         }
     }
 

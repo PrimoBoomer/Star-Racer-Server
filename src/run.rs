@@ -63,10 +63,24 @@ fn spawn_game_loop(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
                 lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
             };
 
+            // Spawn each lobby update as an independent task so the multi-thread
+            // runtime distributes physics steps and WS sends across OS threads.
+            let handles: Vec<_> = lobby_arcs
+                .into_iter()
+                .map(|(name, arc)| {
+                    tokio::spawn(async move {
+                        let alive = arc.lock().await.update(delta);
+                        (name, alive)
+                    })
+                })
+                .collect();
+
             let mut to_remove = Vec::new();
-            for (name, lobby_arc) in &lobby_arcs {
-                if !lobby_arc.lock().await.update(delta).await {
-                    to_remove.push(name.clone());
+            for handle in handles {
+                if let Ok((name, alive)) = handle.await {
+                    if !alive {
+                        to_remove.push(name);
+                    }
                 }
             }
             if !to_remove.is_empty() {
@@ -91,13 +105,16 @@ fn spawn_debug_logger(lobbies: Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-            let lock = lobbies.lock().await;
-            if lock.is_empty() {
-                continue;
-            }
-            sr_log!(trace, "core", "--- lobbies ({}) ---", lock.len());
-            for (name, lobby) in lock.iter() {
-                let l = lobby.lock().await;
+            let arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
+                let lock = lobbies.lock().await;
+                if lock.is_empty() {
+                    continue;
+                }
+                sr_log!(trace, "core", "--- lobbies ({}) ---", lock.len());
+                lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            };
+            for (name, arc) in arcs {
+                let l = arc.lock().await;
                 let state = if l.is_racing() { "racing" } else { "intermission" };
                 sr_log!(trace, "core", "  [{}] owner={} players={}/{} state={}",
                     name, l.owner, l.player_count(), l.max_players, state);
@@ -210,12 +227,17 @@ async fn handle_request(
 async fn build_lobby_list(
     lobbies: &Arc<Mutex<HashMap<String, Arc<Mutex<Lobby>>>>>,
 ) -> Vec<LobbyInfo> {
-    let lock = lobbies.lock().await;
-    let mut list = Vec::with_capacity(lock.len());
-    for (name, lobby) in lock.iter() {
-        let l = lobby.lock().await;
+    // Snapshot the Arc handles while holding the outer lock, then release it
+    // before locking each inner lobby — same pattern as the game loop.
+    let arcs: Vec<(String, Arc<Mutex<Lobby>>)> = {
+        let lock = lobbies.lock().await;
+        lock.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
+    let mut list = Vec::with_capacity(arcs.len());
+    for (name, arc) in arcs {
+        let l = arc.lock().await;
         list.push(LobbyInfo {
-            name: name.clone(),
+            name,
             owner: l.owner.clone(),
             start_time: l.start_time.clone(),
             player_count: l.player_count(),
