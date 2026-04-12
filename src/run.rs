@@ -1,6 +1,6 @@
 use crate::{
     error::Error,
-    lobby::{send_join_error, spawn_ws_writer, Lobby},
+    lobby::{send_join_error, spawn_ws_writer, Lobby, OutgoingMessage},
     protocol::{ClientMessage, ColorProto, JoinError, LobbyInfo, RequestMessage, Response, ServerMessage},
     sr_log, Result,
 };
@@ -24,14 +24,14 @@ enum LobbyCommand {
         min_players: u8,
         max_players: u8,
         color: ColorProto,
-        tx_out: mpsc::UnboundedSender<Message>,
+        tx_out: mpsc::UnboundedSender<OutgoingMessage>,
         rx_stream: SplitStream<WebSocketStream<TcpStream>>,
     },
     Join {
         lobby_id: String,
         nickname: String,
         color: ColorProto,
-        tx_out: mpsc::UnboundedSender<Message>,
+        tx_out: mpsc::UnboundedSender<OutgoingMessage>,
         rx_stream: SplitStream<WebSocketStream<TcpStream>>,
     },
 }
@@ -51,6 +51,9 @@ pub async fn run_with_listener(listener: TcpListener) -> Result<()> {
 
     loop {
         let (stream, peer_addr) = listener.accept().await.map_err(Error::TcpError)?;
+        if let Err(e) = stream.set_nodelay(true) {
+            sr_log!(trace, peer_addr, "Failed to enable TCP_NODELAY: {}", e);
+        }
         sr_log!(trace, peer_addr, ">TCP");
         tokio::spawn(handle_connection(stream, peer_addr.to_string(), cmd_tx.clone()));
     }
@@ -212,7 +215,7 @@ async fn handle_connection(stream: TcpStream, peer_addr: String, cmd_tx: mpsc::S
         sr_log!(trace, peer_addr, "WebSocket handshake failed for {}", peer_addr);
         return;
     };
-    sr_log!(info, peer_addr, "Connected");
+    sr_log!(trace, peer_addr, "Connected");
 
     loop {
         match ws.next().await {
@@ -235,7 +238,7 @@ async fn handle_connection(stream: TcpStream, peer_addr: String, cmd_tx: mpsc::S
                 }
             }
             Some(Ok(Message::Close(_))) => {
-                sr_log!(info, peer_addr, "Closed");
+                sr_log!(trace, peer_addr, "Closed");
                 return;
             }
             Some(Ok(_)) => {
@@ -262,7 +265,7 @@ async fn handle_request(
 ) -> Option<WebSocketStream<TcpStream>> {
     match request {
         RequestMessage::FetchLobbyList => {
-            sr_log!(info, peer_addr, "Fetching lobby list");
+            sr_log!(trace, peer_addr, "Fetching lobby list");
             let (resp_tx, resp_rx) = oneshot::channel();
             if cmd_tx.send(LobbyCommand::FetchList { resp: resp_tx }).await.is_err() {
                 return None;
@@ -285,7 +288,7 @@ async fn handle_request(
             max_players,
             color,
         } => {
-            sr_log!(info, peer_addr, "{} creating lobby {}", nickname, lobby_id);
+            sr_log!(trace, peer_addr, "{} creating lobby {}", nickname, lobby_id);
             let (tx_stream, rx_stream) = ws.split();
             let tx_out = spawn_ws_writer(tx_stream);
             let _ = cmd_tx
@@ -307,7 +310,7 @@ async fn handle_request(
             nickname,
             color,
         } => {
-            sr_log!(info, peer_addr, "{} joining lobby {}", nickname, lobby_id);
+            sr_log!(trace, peer_addr, "{} joining lobby {}", nickname, lobby_id);
             let (tx_stream, rx_stream) = ws.split();
             let tx_out = spawn_ws_writer(tx_stream);
             let _ = cmd_tx

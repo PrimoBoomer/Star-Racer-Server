@@ -23,6 +23,12 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 
+#[derive(Clone)]
+pub(crate) enum OutgoingMessage {
+    Reliable(Message),
+    State(Message),
+}
+
 struct PhysicsWorld {
     rigid_body_set: RigidBodySet,
     collider_set: ColliderSet,
@@ -91,6 +97,7 @@ impl PhysicsWorld {
     fn insert_body(&mut self, pos: Vec3Proto) -> RigidBodyHandle {
         let rb = RigidBodyBuilder::dynamic()
             .translation(Vec3::new(pos.x, pos.y, pos.z))
+            .enabled_rotations(false, true, false)
             .linear_damping(NORMAL_LINEAR_DAMPING)
             .angular_damping(0.5)
             .build();
@@ -132,6 +139,8 @@ const MAX_TURN_RATE_DRIFT: f64 = 3.2;
 const STEER_P_GAIN: f64 = 25_000.0;
 const LATERAL_GRIP: f64 = 0.90;
 const LATERAL_DRIFT: f64 = 0.08;
+const MOTION_DIRECTION_EPSILON: f64 = 0.25;
+const TURN_DRAG_PER_STEER: f64 = 0.16;
 const WALL_COLLISION: InteractionGroups = InteractionGroups::new(
     Group::GROUP_1,
     Group::GROUP_1.union(Group::GROUP_2),
@@ -142,6 +151,7 @@ const CAR_COLLISION: InteractionGroups =
 
 const NORMAL_LINEAR_DAMPING: f64 = 0.3;
 const DRIFT_LINEAR_DAMPING: f64 = 0.18;
+const DRIFT_MIN_SPEED: f64 = 3.0;
 
 const LAPS_TO_WIN: u8 = 3;
 
@@ -156,6 +166,7 @@ const CHECKPOINT_X: f64 = -145.0;
 const CHECKPOINT_X_HALF: f64 = 55.0;
 
 const FINISH_WAIT_SECS: f64 = 30.0;
+const STATE_SYNC_INTERVAL: f64 = 1.0 / 60.0;
 
 #[derive(Default, Clone, Copy)]
 struct PlayerInput {
@@ -167,11 +178,47 @@ struct PlayerInput {
     star_drift: bool,
 }
 
+fn update_reverse_mode(was_reversing: bool, forward_speed: f64) -> bool {
+    if forward_speed <= -MOTION_DIRECTION_EPSILON {
+        true
+    } else if forward_speed >= MOTION_DIRECTION_EPSILON {
+        false
+    } else {
+        was_reversing
+    }
+}
+
+fn effective_steer_input(steer: f64, is_reversing: bool) -> f64 {
+    if is_reversing {
+        -steer
+    } else {
+        steer
+    }
+}
+
+fn stabilize_quaternion(prev: Option<QuatProto>, current: QuatProto) -> QuatProto {
+    let Some(prev) = prev else {
+        return current;
+    };
+
+    let dot = prev.x * current.x + prev.y * current.y + prev.z * current.z + prev.w * current.w;
+    if dot < 0.0 {
+        QuatProto {
+            x: -current.x,
+            y: -current.y,
+            z: -current.z,
+            w: -current.w,
+        }
+    } else {
+        current
+    }
+}
+
 pub(crate) struct Racer {
     nickname: String,
     racing: bool,
     color: ColorProto,
-    tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    tx: tokio::sync::mpsc::UnboundedSender<OutgoingMessage>,
     rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
     idx: u8,
     rigid_body: RigidBodyHandle,
@@ -181,6 +228,8 @@ pub(crate) struct Racer {
     crossed_positive_z: bool,
     crossed_halfway: bool,
     finished: bool,
+    reversing: bool,
+    last_sent_rotation: Option<QuatProto>,
 }
 
 impl Racer {
@@ -188,7 +237,7 @@ impl Racer {
         nickname: String,
         idx: u8,
         color: ColorProto,
-        tx: tokio::sync::mpsc::UnboundedSender<Message>,
+        tx: tokio::sync::mpsc::UnboundedSender<OutgoingMessage>,
         rx_channel: crossbeam::channel::Receiver<PlayerEvent>,
         handle: RigidBodyHandle,
     ) -> Self {
@@ -206,6 +255,8 @@ impl Racer {
             crossed_positive_z: false,
             crossed_halfway: false,
             finished: false,
+            reversing: false,
+            last_sent_rotation: None,
         }
     }
 }
@@ -351,11 +402,11 @@ impl Lobby {
         self.physics.collider_set.insert(wall_w);
     }
 
-    pub fn join(
+    pub(crate) fn join(
         &mut self,
         nickname: String,
         color: ColorProto,
-        tx_out: tokio::sync::mpsc::UnboundedSender<Message>,
+        tx_out: tokio::sync::mpsc::UnboundedSender<OutgoingMessage>,
         rx_stream: SplitStream<WebSocketStream<TcpStream>>,
     ) -> Result<()> {
         if self.racers.contains_key(&nickname) {
@@ -369,7 +420,7 @@ impl Lobby {
 
         let player_idx = self.first_free_idx();
         sr_log!(
-            info,
+            trace,
             &nickname,
             "Joined lobby \"{}\" (idx={}, players={}/{})",
             self.name,
@@ -385,7 +436,7 @@ impl Lobby {
             max_players: self.max_players,
             error: None,
         });
-        let _ = tx_out.send(serialize_server_message(&join_msg));
+        let _ = tx_out.send(outgoing_server_message(&join_msg));
 
         let (tx_channel, rx_channel) = crossbeam::channel::unbounded::<PlayerEvent>();
         launch_client_reader(nickname.clone(), tx_channel, rx_stream);
@@ -429,7 +480,7 @@ impl Lobby {
                 match event {
                     PlayerEvent::Close => {
                         sr_log!(
-                            info,
+                            trace,
                             &racer.nickname,
                             "Left lobby \"{}\" ({} remaining)",
                             self.name,
@@ -467,12 +518,13 @@ impl Lobby {
             let rb = self.physics.get_mut(racer.rigid_body).unwrap();
 
             let speed = rb.linvel().length();
-            let is_drifting = racer.input.star_drift && speed > 3.0;
+            let is_drifting = racer.input.star_drift && speed > DRIFT_MIN_SPEED;
             rb.reset_forces(true);
 
             let forward = *rb.rotation() * Vec3::new(0., 0., 1.);
 
             let forward_speed = -forward.dot(rb.linvel());
+            racer.reversing = update_reverse_mode(racer.reversing, forward_speed);
 
             if racer.input.throttle {
                 rb.add_force(-forward * THROTTLE_FORCE, true);
@@ -480,7 +532,7 @@ impl Lobby {
 
             let steer = racer.input.steer_right - racer.input.steer_left;
 
-            let effective_steer = if forward_speed >= -0.5 { steer } else { -steer };
+            let effective_steer = effective_steer_input(steer, racer.reversing);
             let max_turn = if is_drifting {
                 MAX_TURN_RATE_DRIFT
             } else {
@@ -498,6 +550,15 @@ impl Lobby {
             let mass = rb.mass();
             rb.apply_impulse(-right * lateral_speed * mass * grip_cancel, true);
 
+            let steer_amount = effective_steer.abs();
+            if steer_amount > 0.0 && forward_speed > 0.0 {
+                let turn_drag = (1.0 - TURN_DRAG_PER_STEER * steer_amount).clamp(0.0, 1.0);
+                let linvel = rb.linvel();
+                let lateral_component = right * lateral_speed;
+                let forward_component = linvel - lateral_component;
+                rb.set_linvel(forward_component * turn_drag + lateral_component, true);
+            }
+
             rb.set_linear_damping(if is_drifting {
                 DRIFT_LINEAR_DAMPING
             } else {
@@ -514,29 +575,35 @@ impl Lobby {
 
     fn broadcast_player_states(&mut self, delta: f64) {
         self.sync_timer += delta;
-        if self.sync_timer <= 0.05 {
+        if self.sync_timer < STATE_SYNC_INTERVAL {
             return;
         }
         self.sync_timer = 0.;
 
+        let physics = &self.physics;
         let mut states = Vec::with_capacity(self.racers.len());
-        for (nickname, racer) in &self.racers {
-            let Some(rb) = self.physics.get(racer.rigid_body) else {
+        for (nickname, racer) in &mut self.racers {
+            let Some(rb) = physics.get(racer.rigid_body) else {
                 continue;
             };
             let t = rb.translation();
             let r = rb.rotation();
-            states.push(PlayerState {
-                nickname: nickname.clone(),
-                racing: racer.racing,
-                laps: racer.laps,
-                position: Vec3Proto { x: t.x, y: t.y, z: t.z },
-                rotation: QuatProto {
+            let rotation = stabilize_quaternion(
+                racer.last_sent_rotation,
+                QuatProto {
                     x: r.x,
                     y: r.y,
                     z: r.z,
                     w: r.w,
                 },
+            );
+            racer.last_sent_rotation = Some(rotation);
+            states.push(PlayerState {
+                nickname: nickname.clone(),
+                racing: racer.racing,
+                laps: racer.laps,
+                position: Vec3Proto { x: t.x, y: t.y, z: t.z },
+                rotation,
                 color: racer.color,
             });
         }
@@ -611,7 +678,7 @@ impl Lobby {
                 y_rotation: self.spawn_y_rotation,
                 position: spawn_pos,
             };
-            let _ = racer.tx.send(serialize_server_message(&ServerMessage::Event(
+            let _ = racer.tx.send(outgoing_server_message(&ServerMessage::Event(
                 LobbyEvent::RaceAboutToStart(spawn_info),
             )));
             racer.laps = 0;
@@ -620,6 +687,8 @@ impl Lobby {
             racer.crossed_halfway = false;
             racer.finished = false;
             racer.racing = true;
+            racer.reversing = false;
+            racer.last_sent_rotation = None;
         }
         self.race_timer = 0.;
         self.finish_timer = 0.;
@@ -635,7 +704,7 @@ impl Lobby {
                 self.sync_countdown_timer = 0.;
 
                 let time = (5. - self.start_timer).max(0.);
-                let msg = serialize_server_message(&ServerMessage::Event(LobbyEvent::Countdown { time }));
+                let msg = outgoing_server_message(&ServerMessage::Event(LobbyEvent::Countdown { time }));
                 for racer in self.racers.values() {
                     let _ = racer.tx.send(msg.clone());
                 }
@@ -751,7 +820,7 @@ impl Lobby {
                 racer.crossed_positive_z = false;
                 racer.crossed_halfway = false;
 
-                sr_log!(info, &racer.nickname, "Lap {}/{}", racer.laps, LAPS_TO_WIN);
+                sr_log!(trace, &racer.nickname, "Lap {}/{}", racer.laps, LAPS_TO_WIN);
 
                 if racer.laps >= LAPS_TO_WIN {
                     racer.finished = true;
@@ -768,7 +837,7 @@ impl Lobby {
     }
 
     fn broadcast_message(&self, message: ServerMessage, for_racing_players: bool) {
-        let message = serialize_server_message(&message);
+        let message = outgoing_server_message(&message);
         for racer in self.racers.values() {
             if for_racing_players && !racer.racing {
                 continue;
@@ -796,7 +865,47 @@ fn serialize_server_message(message: &ServerMessage) -> Message {
     Message::Text(serde_json::to_string(message).unwrap().into())
 }
 
-pub fn send_join_error(tx_out: &tokio::sync::mpsc::UnboundedSender<Message>, error: JoinError) {
+fn outgoing_server_message(message: &ServerMessage) -> OutgoingMessage {
+    let encoded = serialize_server_message(message);
+    match message {
+        ServerMessage::State(_) => OutgoingMessage::State(encoded),
+        ServerMessage::Event(_) | ServerMessage::Response(_) => OutgoingMessage::Reliable(encoded),
+    }
+}
+
+fn collect_outgoing_batch(
+    first: OutgoingMessage,
+    rx_out: &mut tokio::sync::mpsc::UnboundedReceiver<OutgoingMessage>,
+) -> Vec<Message> {
+    fn push_message(batch: &mut Vec<Message>, latest_state: &mut Option<Message>, outgoing: OutgoingMessage) {
+        match outgoing {
+            OutgoingMessage::Reliable(message) => {
+                if let Some(state) = latest_state.take() {
+                    batch.push(state);
+                }
+                batch.push(message);
+            }
+            OutgoingMessage::State(message) => {
+                *latest_state = Some(message);
+            }
+        }
+    }
+
+    let mut batch = Vec::with_capacity(4);
+    let mut latest_state = None;
+
+    push_message(&mut batch, &mut latest_state, first);
+    while let Ok(next) = rx_out.try_recv() {
+        push_message(&mut batch, &mut latest_state, next);
+    }
+    if let Some(state) = latest_state {
+        batch.push(state);
+    }
+
+    batch
+}
+
+pub(crate) fn send_join_error(tx_out: &tokio::sync::mpsc::UnboundedSender<OutgoingMessage>, error: JoinError) {
     let msg = ServerMessage::Response(Response::LobbyJoined {
         track_id: 0,
         race_ongoing: false,
@@ -804,18 +913,20 @@ pub fn send_join_error(tx_out: &tokio::sync::mpsc::UnboundedSender<Message>, err
         max_players: 0,
         error: Some(error),
     });
-    let _ = tx_out.send(serialize_server_message(&msg));
+    let _ = tx_out.send(outgoing_server_message(&msg));
 }
 
-pub fn spawn_ws_writer(
+pub(crate) fn spawn_ws_writer(
     tx_stream: futures_util::stream::SplitSink<WebSocketStream<TcpStream>, Message>,
-) -> tokio::sync::mpsc::UnboundedSender<Message> {
-    let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<Message>();
+) -> tokio::sync::mpsc::UnboundedSender<OutgoingMessage> {
+    let (tx_out, mut rx_out) = tokio::sync::mpsc::unbounded_channel::<OutgoingMessage>();
     tokio::spawn(async move {
         let mut sink = tx_stream;
-        while let Some(msg) = rx_out.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+        while let Some(first) = rx_out.recv().await {
+            for msg in collect_outgoing_batch(first, &mut rx_out) {
+                if sink.send(msg).await.is_err() {
+                    return;
+                }
             }
         }
     });
@@ -861,4 +972,102 @@ fn launch_client_reader(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_outgoing_batch, effective_steer_input, stabilize_quaternion, update_reverse_mode, OutgoingMessage,
+    };
+    use crate::protocol::QuatProto;
+    use tokio::sync::mpsc::unbounded_channel;
+    use tungstenite::Message;
+
+    fn text(label: &str) -> Message {
+        Message::Text(label.to_string().into())
+    }
+
+    fn labels(messages: Vec<Message>) -> Vec<String> {
+        messages
+            .into_iter()
+            .map(|message| match message {
+                Message::Text(text) => text.to_string(),
+                other => panic!("unexpected message: {:?}", other),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outgoing_batch_keeps_only_latest_state() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(OutgoingMessage::State(text("state-1"))).unwrap();
+        tx.send(OutgoingMessage::State(text("state-2"))).unwrap();
+        tx.send(OutgoingMessage::State(text("state-3"))).unwrap();
+
+        let first = rx.try_recv().unwrap();
+        let batch = collect_outgoing_batch(first, &mut rx);
+
+        assert_eq!(labels(batch), vec!["state-3"]);
+    }
+
+    #[test]
+    fn outgoing_batch_preserves_reliable_order_between_states() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(OutgoingMessage::State(text("state-1"))).unwrap();
+        tx.send(OutgoingMessage::State(text("state-2"))).unwrap();
+        tx.send(OutgoingMessage::Reliable(text("event-a"))).unwrap();
+        tx.send(OutgoingMessage::State(text("state-3"))).unwrap();
+        tx.send(OutgoingMessage::Reliable(text("event-b"))).unwrap();
+        tx.send(OutgoingMessage::State(text("state-4"))).unwrap();
+
+        let first = rx.try_recv().unwrap();
+        let batch = collect_outgoing_batch(first, &mut rx);
+
+        assert_eq!(
+            labels(batch),
+            vec!["state-2", "event-a", "state-3", "event-b", "state-4"]
+        );
+    }
+
+    #[test]
+    fn reverse_mode_sticks_around_zero_speed() {
+        assert!(update_reverse_mode(true, 0.0));
+        assert!(update_reverse_mode(true, -0.1));
+        assert!(!update_reverse_mode(false, 0.0));
+    }
+
+    #[test]
+    fn reverse_mode_tracks_motion_direction() {
+        assert!(update_reverse_mode(false, -1.0));
+        assert!(!update_reverse_mode(true, 1.0));
+    }
+
+    #[test]
+    fn steering_mirrors_only_in_reverse_mode() {
+        assert_eq!(effective_steer_input(0.75, false), 0.75);
+        assert_eq!(effective_steer_input(0.75, true), -0.75);
+    }
+
+    #[test]
+    fn quaternion_sign_is_kept_continuous() {
+        let prev = QuatProto {
+            x: 0.0,
+            y: 0.3,
+            z: 0.0,
+            w: 0.95,
+        };
+        let current = QuatProto {
+            x: -prev.x,
+            y: -prev.y,
+            z: -prev.z,
+            w: -prev.w,
+        };
+
+        let stabilized = stabilize_quaternion(Some(prev), current);
+
+        assert!(stabilized.x >= 0.0 || prev.x == 0.0);
+        assert_eq!(stabilized.y, prev.y);
+        assert_eq!(stabilized.z, prev.z);
+        assert_eq!(stabilized.w, prev.w);
+    }
 }
